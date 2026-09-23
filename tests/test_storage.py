@@ -247,6 +247,64 @@ EXPECTED_COLUMNS = {
 }
 
 
+def test_full_flow_leaves_no_sensitive_bytes(tmp_path):
+    """End-to-end negative proof: real keys/rows/updates never reach SQLite.
+
+    Runs joins + a query + a federated round, then scans the database for
+    the exact sensitive values the test controls. Absence here means the
+    codec/store path never carried them (it only ever sees aggregates).
+    """
+    import numpy as np
+
+    from sentrylink.crypto.secure_aggregation import SecAggClient, quantize
+    from sentrylink.federated.client import FederatedClient
+    from sentrylink.platform import SentryLinkPlatform
+    from sentrylink.usecases import make_retail_cohort
+    from tests.sentinel_scan import SECRET_SENTINEL, scan_sqlite
+
+    db = str(tmp_path / "flow.db")
+    p = SentryLinkPlatform(store=SQLiteStateStore(db))
+    orgs = make_retail_cohort(n_orgs=3, n_per_org=40, seed=7)
+    ids = [p.join(o.name, "retail", "g-flow").org_id for o in orgs]
+    api_keys = [p.registry.get(oid).api_key for oid in ids]
+    clients = {oid: FederatedClient(org_id=oid, x=o.x, y=o.y) for oid, o in zip(ids, orgs)}
+    p.run_federated_round("g-flow", "retail", clients, epsilon=8.0, epochs=1)
+    p.histogram("g-flow", "retail", {oid: [3, 1] for oid in ids}, epsilon=1.0)
+    # Category representatives that must never persist (never sent to store).
+    ghost = SecAggClient("ghost", "round-x", ["ghost", "other"], 4)
+    ghost_key = ghost._private_key.private_bytes_raw()
+    ghost_update = quantize(np.random.default_rng(0).normal(size=4)).tobytes()
+    p.store.close()
+
+    sentinels = {
+        "api_key": [k.encode() for k in api_keys],
+        "raw_features": [o.x.tobytes() for o in orgs],
+        "private_key": [ghost_key],
+        "unmasked_update": [ghost_update],
+    }
+    assert scan_sqlite(db, sentinels) == []
+
+
+def test_scanner_detects_planted_sentinel(tmp_path):
+    """Positive control: the scanner is sensitive, not vacuous."""
+    import sqlite3
+
+    from tests.sentinel_scan import SECRET_SENTINEL, scan_sqlite
+
+    db = str(tmp_path / "planted.db")
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT)")
+        conn.execute("INSERT INTO t (note) VALUES (?)", (f"leak:{SECRET_SENTINEL}",))
+        conn.commit()
+    finally:
+        conn.close()
+    findings = scan_sqlite(db, {"secret": [SECRET_SENTINEL.encode()]})
+    assert len(findings) >= 1
+    assert findings[0]["category"] == "secret"
+    assert scan_sqlite(db, {"other": [b"absent-value-xyz"]}) == []
+
+
 def test_no_sensitive_data_persisted(tmp_path):
     from pathlib import Path
 

@@ -126,6 +126,102 @@ def test_server_holds_no_private_key_material():
     assert not _contains_privkey(server)
 
 
+def _walk_values(obj, _seen=None):
+    """Yield every reachable scalar/bytes value (for byte-level scans)."""
+    _seen = _seen if _seen is not None else set()
+    if id(obj) in _seen:
+        return
+    _seen.add(id(obj))
+    if isinstance(obj, (bytes, bytearray)):
+        yield bytes(obj)
+        return
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _walk_values(v, _seen)
+        return
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        for v in obj:
+            yield from _walk_values(v, _seen)
+        return
+    if hasattr(obj, "__dataclass_fields__"):
+        for f in dataclasses.fields(obj):
+            yield from _walk_values(getattr(obj, f.name), _seen)
+        return
+    if hasattr(obj, "__dict__"):
+        yield from _walk_values(vars(obj), _seen)
+
+
+def test_server_holds_no_private_key_bytes_or_seeds():
+    roster = ["a", "b", "c"]
+    server, clients = _make_round(roster, 4)
+    rng = np.random.default_rng(11)
+    keys = server.public_keys()
+    for oid, c in clients.items():
+        server.receive(c.mask_and_send(rng.normal(size=4), keys))
+    server.finalize()
+    assert server._revealed_seeds == {}  # no dropout: no seed retained
+    private_raw = {c._private_key.private_bytes_raw() for c in clients.values()}
+    blob = b"".join(v for v in _walk_values(server) if isinstance(v, bytes))
+    for raw in private_raw:
+        assert raw not in blob
+    assert all(raw not in repr(server).encode() for raw in private_raw)
+
+
+def test_server_has_no_reference_path_to_clients():
+    roster = ["a", "b"]
+    server, clients = _make_round(roster, 4)
+    keys = server.public_keys()
+    for oid, c in clients.items():
+        server.receive(c.mask_and_send(np.zeros(4), keys))
+    assert not _contains_privkey(server)
+
+    found = []
+
+    def _find_clients(obj, _seen=None):
+        _seen = _seen if _seen is not None else set()
+        if id(obj) in _seen:
+            return
+        _seen.add(id(obj))
+        if isinstance(obj, SecAggClient):
+            found.append(obj)
+            return
+        if isinstance(obj, dict):
+            for v in obj.values():
+                _find_clients(v, _seen)
+        elif isinstance(obj, (list, tuple, set, frozenset)):
+            for v in obj:
+                _find_clients(v, _seen)
+        elif hasattr(obj, "__dataclass_fields__"):
+            for f in dataclasses.fields(obj):
+                _find_clients(getattr(obj, f.name), _seen)
+        elif hasattr(obj, "__dict__"):
+            _find_clients(vars(obj), _seen)
+
+    _find_clients(server)
+    assert found == []
+
+
+def test_server_shape_has_no_hidden_key_fields():
+    # Tripwire: adding a private-key holder to SecAggServer breaks this on
+    # purpose, forcing the author to update the isolation tests too.
+    assert {f.name for f in dataclasses.fields(SecAggServer)} == {
+        "round_id", "roster", "dim", "_keys", "_contributions", "_revealed_seeds",
+    }
+
+
+def test_server_survives_copy_without_leaking():
+    import copy
+
+    roster = ["a", "b"]
+    server, clients = _make_round(roster, 4)
+    keys = server.public_keys()
+    for oid, c in clients.items():
+        server.receive(c.mask_and_send(np.ones(4), keys))
+    clone = copy.deepcopy(server)
+    assert not _contains_privkey(clone)
+    np.testing.assert_allclose(clone.finalize(), server.finalize(), atol=1e-12)
+
+
 def test_server_rejects_non_roster_and_bad_dims():
     server, clients = _make_round(["a", "b"], 4)
     import pytest
