@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 
 from .. import __version__
@@ -48,6 +48,30 @@ PLATFORM = build_platform()
 
 def get_platform() -> SentryLinkPlatform:
     return PLATFORM
+
+
+def require_cohort_member(
+    platform: SentryLinkPlatform,
+    sector_group: str,
+    domain: str,
+    org_id: str | None,
+    api_key: str | None,
+):
+    """Authenticate the caller and authorize it for this cohort.
+
+    401 = missing/unknown credential or bad key; 403 = valid credential for
+    an org outside the queried cohort. Runs before any budget is spent.
+    """
+    if not org_id or not api_key:
+        raise HTTPException(status_code=401, detail="missing credentials")
+    try:
+        org = platform.registry.authenticate(org_id, api_key)
+    except (KeyError, PermissionError) as exc:
+        raise HTTPException(status_code=401, detail="invalid credentials") from exc
+    cohort_ids = {o.org_id for o in platform.registry.cohort(sector_group, domain)}
+    if org.org_id not in cohort_ids:
+        raise HTTPException(status_code=403, detail="org is not a member of this cohort")
+    return org
 
 
 @app.exception_handler(RuntimeError)
@@ -120,6 +144,7 @@ def update_consent(req: ConsentRequest) -> dict:
 @app.post("/queries/histogram", response_model=QueryResultResponse)
 def query_histogram(req: HistogramQuery) -> QueryResultResponse:
     p = get_platform()
+    require_cohort_member(p, req.sector_group, req.domain, req.org_id, req.api_key)
     try:
         res = p.histogram(
             req.sector_group,
@@ -149,6 +174,7 @@ def query_histogram(req: HistogramQuery) -> QueryResultResponse:
 @app.post("/queries/variance", response_model=QueryResultResponse)
 def query_variance(req: VarianceQuery) -> QueryResultResponse:
     p = get_platform()
+    require_cohort_member(p, req.sector_group, req.domain, req.org_id, req.api_key)
     try:
         res = p.variance(
             req.sector_group,
@@ -177,6 +203,7 @@ def query_variance(req: VarianceQuery) -> QueryResultResponse:
 @app.post("/queries/correlation", response_model=QueryResultResponse)
 def query_correlation(req: CorrelationQuery) -> QueryResultResponse:
     p = get_platform()
+    require_cohort_member(p, req.sector_group, req.domain, req.org_id, req.api_key)
     try:
         pairs = {k: (list(v[0]), list(v[1])) for k, v in req.org_pairs.items()}
         res = p.correlation(
@@ -206,6 +233,7 @@ def query_correlation(req: CorrelationQuery) -> QueryResultResponse:
 @app.post("/federated/round", response_model=RoundResponse)
 def federated_round(req: FederatedRoundRequest) -> RoundResponse:
     p = get_platform()
+    require_cohort_member(p, req.sector_group, req.domain, req.org_id, req.api_key)
     clients = [
         FederatedClient(org_id=c.org_id, x=np.asarray(c.x, dtype=np.float64), y=np.asarray(c.y))
         for c in req.clients
@@ -237,8 +265,14 @@ def federated_round(req: FederatedRoundRequest) -> RoundResponse:
 
 
 @app.get("/federated/model")
-def get_model(sector_group: str, domain: str) -> dict:
+def get_model(
+    sector_group: str,
+    domain: str,
+    x_org_id: str | None = Header(default=None, alias="X-Org-Id"),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict:
     p = get_platform()
+    require_cohort_member(p, sector_group, domain, x_org_id, x_api_key)
     key = f"{sector_group}:{domain}"
     if key not in p.servers:
         raise HTTPException(status_code=404, detail="no model for this cohort")

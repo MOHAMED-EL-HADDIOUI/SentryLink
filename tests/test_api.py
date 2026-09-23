@@ -72,11 +72,12 @@ def test_consent_requires_valid_key(client):
 
 
 def test_histogram_requires_min_cohort(client):
-    for i in range(2):
-        _join(client, f"Org{i}", "retail", "g-small")
+    members = [_join(client, f"Org{i}", "retail", "g-small") for i in range(2)]
     r = client.post(
         "/queries/histogram",
         json={
+            "org_id": members[0]["org_id"],
+            "api_key": members[0]["api_key"],
             "sector_group": "g-small",
             "domain": "retail",
             "org_buckets": {"x": [1, 2]},
@@ -94,6 +95,8 @@ def test_histogram_happy_path(client):
     r = client.post(
         "/queries/histogram",
         json={
+            "org_id": orgs[0]["org_id"],
+            "api_key": orgs[0]["api_key"],
             "sector_group": "g-hist",
             "domain": "retail",
             "org_buckets": buckets,
@@ -110,6 +113,75 @@ def test_histogram_happy_path(client):
     assert all(isinstance(v, int) for v in body["value"].values())
 
 
+def _hist_payload(org, group, domain="retail", buckets=None, key=None):
+    return {
+        "org_id": org["org_id"],
+        "api_key": key if key is not None else org["api_key"],
+        "sector_group": group,
+        "domain": domain,
+        "org_buckets": buckets or {org["org_id"]: [1, 2]},
+        "epsilon": 1.0,
+    }
+
+
+def test_histogram_missing_credentials_rejected(client):
+    a = _join(client, "A", "retail", "g-auth")
+    payload = _hist_payload(a, "g-auth")
+    del payload["org_id"]
+    del payload["api_key"]
+    assert client.post("/queries/histogram", json=payload).status_code == 422
+
+
+def test_histogram_bad_and_unknown_credentials_rejected(client):
+    a = _join(client, "A", "retail", "g-auth")
+    _join(client, "B", "retail", "g-auth")
+    _join(client, "C", "retail", "g-auth")
+    assert client.post(
+        "/queries/histogram", json=_hist_payload(a, "g-auth", key="wrong")
+    ).status_code == 401
+    ghost = dict(a, org_id="ghost")
+    assert client.post(
+        "/queries/histogram", json=_hist_payload(ghost, "g-auth")
+    ).status_code == 401
+
+
+def test_histogram_non_member_rejected(client):
+    insider = _join(client, "In", "retail", "g-in")
+    _join(client, "In2", "retail", "g-in")
+    _join(client, "In3", "retail", "g-in")
+    outsider = _join(client, "Out", "retail", "g-out")
+    buckets = {o: [1, 2] for o in [insider["org_id"], "x", "y"]}
+    # valid key, but the org belongs to another cohort
+    r = client.post(
+        "/queries/histogram", json=_hist_payload(outsider, "g-in", buckets=buckets)
+    )
+    assert r.status_code == 403
+    # and the insider passes auth (governance may still deny on data, not auth)
+    r = client.post(
+        "/queries/histogram", json=_hist_payload(insider, "g-in", buckets=buckets)
+    )
+    assert r.status_code != 401
+
+
+def test_federated_model_requires_member_headers(client):
+    r = client.get("/federated/model", params={"sector_group": "g-m", "domain": "retail"})
+    assert r.status_code == 401
+    a = _join(client, "A", "retail", "g-m")
+    r = client.get(
+        "/federated/model",
+        params={"sector_group": "g-m", "domain": "retail"},
+        headers={"X-Org-Id": a["org_id"], "X-API-Key": "wrong"},
+    )
+    assert r.status_code == 401
+    # authenticated member, but no model ran yet for this cohort
+    r = client.get(
+        "/federated/model",
+        params={"sector_group": "g-m", "domain": "retail"},
+        headers={"X-Org-Id": a["org_id"], "X-API-Key": a["api_key"]},
+    )
+    assert r.status_code == 404
+
+
 def test_federated_round_api(client):
     orgs = [_join(client, f"F{i}", "retail", "g-fl") for i in range(4)]
     rng = np.random.default_rng(0)
@@ -121,6 +193,8 @@ def test_federated_round_api(client):
     r = client.post(
         "/federated/round",
         json={
+            "org_id": orgs[0]["org_id"],
+            "api_key": orgs[0]["api_key"],
             "sector_group": "g-fl",
             "domain": "retail",
             "clients": clients_payload,

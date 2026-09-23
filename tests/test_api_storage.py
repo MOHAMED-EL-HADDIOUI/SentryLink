@@ -55,7 +55,8 @@ def test_sqlite_backed_api_flow(sqlite_client):
     buckets = {o["org_id"]: [6, 2] for o in orgs}
     r = sqlite_client.post(
         "/queries/histogram",
-        json={"sector_group": "g-db", "domain": "retail", "org_buckets": buckets, "epsilon": 1.0},
+        json={"org_id": orgs[0]["org_id"], "api_key": orgs[0]["api_key"],
+              "sector_group": "g-db", "domain": "retail", "org_buckets": buckets, "epsilon": 1.0},
     )
     assert r.status_code == 200, r.text
     audit = sqlite_client.get("/audit").json()
@@ -83,7 +84,9 @@ def test_api_state_survives_platform_restart(tmp_path):
     mod.PLATFORM = first
     try:
         with TestClient(app) as c:
-            _join(c, "Acme", "retail", "g-rc")
+            acme = _join(c, "Acme", "retail", "g-rc")
+            _join(c, "B", "retail", "g-rc")
+            _join(c, "C", "retail", "g-rc")
         first.store.close()
         # "restart": brand-new platform object over the same database file
         second = SentryLinkPlatform(store=SQLiteStateStore(db))
@@ -93,6 +96,15 @@ def test_api_state_survives_platform_restart(tmp_path):
                 orgs = c2.get("/orgs").json()
                 assert any(o["name"] == "Acme" for o in orgs)
                 assert c2.get("/ready").json()["ready"] is True
+                # original API key still authenticates (hash path) after restart
+                buckets = {o["org_id"]: [2, 1] for o in orgs}
+                r = c2.post(
+                    "/queries/histogram",
+                    json={"org_id": acme["org_id"], "api_key": acme["api_key"],
+                          "sector_group": "g-rc", "domain": "retail",
+                          "org_buckets": buckets, "epsilon": 1.0},
+                )
+                assert r.status_code == 200, r.text
         finally:
             second.store.close()
     finally:

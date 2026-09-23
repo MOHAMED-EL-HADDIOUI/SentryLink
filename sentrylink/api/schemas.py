@@ -25,7 +25,14 @@ class ConsentRequest(BaseModel):
     allowed_metrics: list[str]
 
 
-class HistogramQuery(BaseModel):
+class MemberAuth(BaseModel):
+    """Cohort-member credential. Required on every budget-spending endpoint."""
+
+    org_id: str
+    api_key: str
+
+
+class HistogramQuery(MemberAuth):
     sector_group: str
     domain: str
     org_buckets: dict[str, list[int]]
@@ -35,7 +42,7 @@ class HistogramQuery(BaseModel):
     purpose: str = "distribution insight"
 
 
-class CorrelationQuery(BaseModel):
+class CorrelationQuery(MemberAuth):
     sector_group: str
     domain: str
     org_pairs: dict[str, tuple[list[float], list[float]]]
@@ -44,7 +51,7 @@ class CorrelationQuery(BaseModel):
     purpose: str = "association insight"
 
 
-class VarianceQuery(BaseModel):
+class VarianceQuery(MemberAuth):
     sector_group: str
     domain: str
     org_values: dict[str, list[float]]
@@ -59,7 +66,7 @@ class FederatedClientData(BaseModel):
     y: list[float]
 
 
-class FederatedRoundRequest(BaseModel):
+class FederatedRoundRequest(MemberAuth):
     sector_group: str
     domain: str
     clients: list[FederatedClientData]

@@ -106,19 +106,35 @@ uvicorn sentrylink.api.app:app --reload
 
 ### API at a glance
 
-| Method | Endpoint               | What it does                              |
-|--------|------------------------|-------------------------------------------|
-| `POST` | `/orgs`                | Onboard an organization (returns api_key) |
-| `POST` | `/consent`             | Set metric allow-list (API-key auth)      |
-| `POST` | `/queries/histogram`   | MPC + DP bucket counts                    |
-| `POST` | `/queries/variance`    | MPC + DP dispersion                       |
-| `POST` | `/queries/correlation` | MPC + DP association                      |
-| `POST` | `/federated/round`     | Secure-aggregated FL round (+DP)          |
-| `GET`  | `/federated/model`     | Global model for a cohort                 |
-| `GET`  | `/audit`               | Verify the hash-chained audit log         |
-| `GET`  | `/budgets`             | ε/δ spent vs. remaining (incl. RDP spend) |
-| `GET`  | `/health`              | Liveness + backend (`memory`/`sqlite`)    |
-| `GET`  | `/ready`               | Readiness: store reachable + chain intact |
+| Method | Endpoint               | Auth | What it does                           |
+|--------|------------------------|------|----------------------------------------|
+| `POST` | `/orgs`                | open | Onboard an organization (returns api_key, shown once) |
+| `POST` | `/consent`             | key  | Set metric allow-list (API-key auth)   |
+| `POST` | `/queries/histogram`   | member | MPC + DP bucket counts               |
+| `POST` | `/queries/variance`    | member | MPC + DP dispersion                  |
+| `POST` | `/queries/correlation` | member | MPC + DP association                 |
+| `POST` | `/federated/round`     | member | Secure-aggregated FL round (+DP)     |
+| `GET`  | `/federated/model`     | member headers | Global model for a cohort    |
+| `GET`  | `/audit`               | open | Verify the hash-chained audit log      |
+| `GET`  | `/budgets`             | open | ε/δ spent vs. remaining (incl. RDP spend) |
+| `GET`  | `/health`              | open | Liveness + backend (`memory`/`sqlite`) |
+| `GET`  | `/ready`               | open | Readiness: store reachable + chain intact |
+
+Auth = `member` means a cohort-member credential: `org_id` + `api_key` in
+the POST body, or `X-Org-Id` / `X-API-Key` headers for `GET /federated/model`
+(API keys never travel in URLs). The credential is verified **before** any
+privacy budget is spent: `401` = missing/unknown/bad key, `403` = valid key
+outside the queried cohort or a governance denial, `422` = malformed body.
+
+```bash
+ORG=<org_id from POST /orgs> && KEY=<api_key from POST /orgs>
+curl -X POST localhost:8000/queries/histogram \
+  -H 'Content-Type: application/json' \
+  -d "{\"org_id\": \"$ORG\", \"api_key\": \"$KEY\", \"sector_group\": \"retail-consortium\",
+       \"domain\": \"retail\", \"org_buckets\": {\"$ORG\": [12, 7, 3]}, \"epsilon\": 1.0}"
+curl 'localhost:8000/federated/model?sector_group=retail-consortium&domain=retail' \
+  -H "X-Org-Id: $ORG" -H "X-API-Key: $KEY"
+```
 
 ### Persistent storage
 
