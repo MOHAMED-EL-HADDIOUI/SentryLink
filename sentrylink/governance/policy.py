@@ -11,7 +11,6 @@ from .registry import Organization, Registry
 
 ALLOWED_METRICS = {
     "histogram",
-    "mean",
     "variance",
     "correlation",
     "federated_model_round",
@@ -86,10 +85,16 @@ class PolicyEngine:
                 continue
             participants.append(org.org_id)
 
-        if len(participants) < MIN_PARTICIPANTS:
+        # Cohort floor: global minimum, raised to the strictest
+        # min_participants among contributing orgs (e.g. healthcare k>=4).
+        required = MIN_PARTICIPANTS
+        for oid in participants:
+            pol = self.policies.get(oid, ConsentPolicy.default())
+            required = max(required, pol.min_participants)
+        if len(participants) < required:
             reasons.append(
                 f"cohort too small: {len(participants)} consented "
-                f"< min_participants={MIN_PARTICIPANTS}"
+                f"< min_participants={required}"
             )
         if req.epsilon <= 0:
             reasons.append("epsilon must be positive")

@@ -7,7 +7,7 @@ aggregated intelligence. No raw row ever leaves an organization.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -21,7 +21,7 @@ from .federated.client import FederatedClient
 from .federated.server import FederatedServer, RoundResult
 from .mpc.stats import run_correlation, run_histogram, run_variance
 from .governance.audit import AuditLog
-from .governance.policy import ConsentPolicy, PolicyEngine, QueryRequest, default_policy_for
+from .governance.policy import PolicyEngine, QueryRequest, default_policy_for
 from .governance.registry import Organization, Registry
 
 NODE_IDS = ["node-a", "node-b"]
@@ -71,7 +71,13 @@ class SentryLinkPlatform:
         return org
 
     def set_consent(self, org_id: str, allowed_metrics: set[str]) -> None:
-        self.policy.set_policy(org_id, ConsentPolicy(allowed_metrics=frozenset(allowed_metrics)))
+        # Replace only the allow-list; preserve the org's other policy terms
+        # (e.g. healthcare's stricter max_epsilon_per_query).
+        org = self.registry.get(org_id)  # existence check (KeyError if unknown)
+        base = self.policy.policies.get(org_id, default_policy_for(org))
+        self.policy.set_policy(
+            org_id, replace(base, allowed_metrics=frozenset(allowed_metrics))
+        )
         self.audit.record("consent.update", org_id=org_id, metrics=sorted(allowed_metrics))
 
     # ---- federated intelligence -------------------------------------

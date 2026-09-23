@@ -65,8 +65,9 @@ The privacy stack, in one breath:
 4. **Differential privacy** — every released number is perturbed: **Laplace**
    (pure ε-DP) for aggregates, **Gaussian** ((ε, δ)-DP) for federated updates,
    all tracked by a privacy accountant.
-5. **Governance** — per-org consent allow-lists, a **k ≥ 3 cohort floor**,
-   per-org contribution caps, and an append-only **hash-chained audit log**.
+5. **Governance** — per-org consent allow-lists, a **k ≥ 3 cohort floor**
+   (k ≥ 4 for healthcare), per-org contribution caps, and an append-only
+   **hash-chained audit log**.
 
 <details>
 <summary><strong>Threat model</strong></summary>
@@ -159,8 +160,9 @@ tests/                    # unit + integration + API tests
   (`MAX_ORG_CONTRIB`) as the bound.
 - **Own-data products are local** — orgs may square / `xy` their own rows before
   sharing; only *cross-org* combination happens on shares.
-- **Healthcare policy is stricter** — narrower metric allow-list (no variance)
-  and a lower per-query ε cap, showcasing policy differentiation.
+- **Healthcare policy is stricter** — higher cohort floor (k ≥ 4), narrower
+  metric allow-list (no variance), and a lower per-query ε cap, showcasing
+  policy differentiation.
 
 ### Production hardening roadmap
 
