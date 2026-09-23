@@ -118,7 +118,9 @@ def demo_retail_narrative() -> SentryLinkPlatform:
         "retail-consortium", "retail", clients, epsilon=4.0, epochs=1,
         drop=[org_ids[-1]])
     print(f"  dropped={dropped.dropped} recovered OK")
-    weights_before = platform.servers["retail-consortium:retail"].model.flat.copy()
+    _server_model = platform.servers["retail-consortium:retail"].model
+    assert _server_model is not None
+    weights_before = _server_model.flat.copy()
 
     _step(10, "aggregate model (FedAvg over masked deltas)")
     meta = platform.model_release_metadata("retail-consortium:retail")
@@ -130,6 +132,7 @@ def demo_retail_narrative() -> SentryLinkPlatform:
           f"sigma={result.dp_sigma:.4f}")
 
     _step(12, "privacy budget charged (immutable ledger entry)")
+    assert platform.accountant is not None
     entry = platform.accountant.events[-1]["ledger"]
     print(f"  {entry['query_type']}: eps={entry['epsilon']} "
           f"mechanism={entry['mechanism']} cohort={entry['cohort_size']}")
@@ -150,10 +153,12 @@ def demo_retail_narrative() -> SentryLinkPlatform:
     print("  original key accepted after restart")
 
     _step(17, "verify model continuity")
-    continued = platform2.servers["retail-consortium:retail"].model.flat
-    print(f"  weights identical: {bool((continued == weights_before).all())}")
+    continued_model = platform2.servers["retail-consortium:retail"].model
+    assert continued_model is not None
+    print(f"  weights identical: {bool((continued_model.flat == weights_before).all())}")
 
     _step(18, "show privacy ledger (sanitized, auditable spend)")
+    assert platform2.accountant is not None
     for event in platform2.accountant.events[-3:]:
         ledger = event["ledger"]
         print(f"  {ledger['query_type']}: eps={ledger['epsilon']} "

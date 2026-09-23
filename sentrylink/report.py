@@ -183,12 +183,14 @@ def _persistence_section() -> dict:
         p.store.close()
         p2 = SentryLinkPlatform(store=SQLiteStateStore(db))
         try:
+            replayed_model = p2.servers["g-rep:retail"].model
+            assert replayed_model is not None
             replay_ok = (
                 sorted(o.org_id for o in p2.registry.list()) == sorted(ids)
                 and p2.budget_report()["spent_epsilon"] == spent
                 and len(p2.audit.entries) == n_audit
                 and p2.audit.verify_chain()
-                and bool(np.allclose(p2.servers["g-rep:retail"].model.flat, r1.model.flat))
+                and bool(np.allclose(replayed_model.flat, r1.model.flat))
             )
         finally:
             p2.store.close()

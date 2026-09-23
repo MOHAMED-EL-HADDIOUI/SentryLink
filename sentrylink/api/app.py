@@ -602,6 +602,8 @@ def transparency() -> dict:
 
     p = get_platform()
     entries = p.audit.entries
+    accountant = p.accountant
+    assert accountant is not None
     return {
         "status": "ok",
         "protocol_version": PROTOCOL_VERSION,
@@ -609,10 +611,10 @@ def transparency() -> dict:
         "storage": p.store.backend_name,
         "orgs": len(p.registry.list()),
         "budget": {
-            "spent_epsilon": p.accountant.spent.epsilon,
-            "remaining_epsilon": p.accountant.remaining.epsilon,
-            "rdp_epsilon_spent": p.accountant.rdp_epsilon(),
-            "events": len(p.accountant.events),
+            "spent_epsilon": accountant.spent.epsilon,
+            "remaining_epsilon": accountant.remaining.epsilon,
+            "rdp_epsilon_spent": accountant.rdp_epsilon(),
+            "events": len(accountant.events),
         },
         "audit": {
             "valid": p.audit.verify_chain(),

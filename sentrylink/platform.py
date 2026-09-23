@@ -151,8 +151,20 @@ class SentryLinkPlatform:
             details["request_id"] = request_id
         return self.audit.record(action, **details)
 
+    @property
+    def _policy(self) -> PolicyEngine:
+        # Set in __post_init__ (or rebuilt by _restore); the assert turns the
+        # Optional field into a statically non-None accessor for method bodies.
+        assert self.policy is not None, "platform policy not initialized"
+        return self.policy
+
+    @property
+    def _accountant(self) -> PrivacyAccountant:
+        assert self.accountant is not None, "platform accountant not initialized"
+        return self.accountant
+
     def _accounting(self) -> str:
-        return "rdp" if self.accountant.rdp_complete else "basic"
+        return "rdp" if self._accountant.rdp_complete else "basic"
 
     def _ledger_entry(
         self,
@@ -201,9 +213,9 @@ class SentryLinkPlatform:
         request_id: str | None = None,
     ) -> Organization:
         org = self.registry.register(name, domain, sector_group)
-        self.policy.set_policy(org.org_id, default_policy_for(org))
+        self._policy.set_policy(org.org_id, default_policy_for(org))
         entry = self._audit(request_id, "org.join", org_id=org.org_id, name=name, domain=domain)
-        policy = self.policy.policies[org.org_id]
+        policy = self._policy.policies[org.org_id]
 
         def _persist(tx: StoreTx) -> None:
             tx.save_org(codec.encode_org(org))
@@ -221,12 +233,12 @@ class SentryLinkPlatform:
         # Replace only the allow-list; preserve the org's other policy terms
         # (e.g. healthcare's stricter max_epsilon_per_query).
         org = self.registry.get(org_id)  # existence check (KeyError if unknown)
-        base = self.policy.policies.get(org_id, default_policy_for(org))
-        self.policy.set_policy(
+        base = self._policy.policies.get(org_id, default_policy_for(org))
+        self._policy.set_policy(
             org_id, replace(base, allowed_metrics=frozenset(allowed_metrics))
         )
         entry = self._audit(request_id, "consent.update", org_id=org_id, metrics=sorted(allowed_metrics))
-        policy = self.policy.policies[org_id]
+        policy = self._policy.policies[org_id]
 
         def _persist(tx: StoreTx) -> None:
             tx.save_policy(org_id, codec.encode_policy(policy))
@@ -257,7 +269,7 @@ class SentryLinkPlatform:
             delta=delta,
             purpose=purpose,
         )
-        decision = self.policy.evaluate(req)
+        decision = self._policy.evaluate(req)
         decision.raise_if_denied()
 
         roster_clients = [
@@ -278,7 +290,7 @@ class SentryLinkPlatform:
         # Charge after a successful round (failed rounds consume no budget).
         # The released mean has replace-one sensitivity 2C/k (see server).
         sens = 2.0 * UPDATE_CLIP / len(result.participants)
-        self.accountant.charge(
+        self._accountant.charge(
             req.budget,
             purpose=purpose,
             subject=key,
@@ -309,7 +321,7 @@ class SentryLinkPlatform:
         )
 
         def _persist(tx: StoreTx) -> None:
-            tx.save_budget(codec.encode_budget(self.accountant))
+            tx.save_budget(codec.encode_budget(self._accountant))
             tx.save_server(codec.encode_server(key, server))
             tx.append_round(key, codec.encode_round(key, result))
             tx.append_audit(entry)
@@ -339,11 +351,11 @@ class SentryLinkPlatform:
             delta=delta,
             purpose=purpose,
         )
-        decision = self.policy.evaluate(req)
+        decision = self._policy.evaluate(req)
         decision.raise_if_denied()
 
         contrib = {
-            oid: self.policy.cap_contributions(org_buckets[oid])
+            oid: self._policy.cap_contributions(org_buckets[oid])
             for oid in decision.participants
             if oid in org_buckets
         }
@@ -359,7 +371,7 @@ class SentryLinkPlatform:
         # is L2-projected onto the MAX_ORG_CONTRIB ball before sharing.
         sens = float(MAX_ORG_CONTRIB)
         # Pure ε-DP (Laplace): charge epsilon only, delta stays 0.
-        self.accountant.charge(
+        self._accountant.charge(
             PrivacyBudget(req.epsilon, 0.0),
             purpose=purpose,
             subject=f"hist:{sector_group}",
@@ -399,7 +411,7 @@ class SentryLinkPlatform:
         )
 
         def _persist_hist(tx: StoreTx) -> None:
-            tx.save_budget(codec.encode_budget(self.accountant))
+            tx.save_budget(codec.encode_budget(self._accountant))
             tx.append_audit(entry)
 
         self._commit(_persist_hist)
@@ -448,7 +460,7 @@ class SentryLinkPlatform:
             delta=delta,
             purpose=purpose,
         )
-        decision = self.policy.evaluate(req)
+        decision = self._policy.evaluate(req)
         decision.raise_if_denied()
         vals = {oid: org_values[oid] for oid in decision.participants}
         if len(vals) != len(decision.participants):
@@ -460,7 +472,7 @@ class SentryLinkPlatform:
             raise InvalidDataError(str(exc)) from exc
         # variance is released with unit-scale sensitivity after bounded
         # org contributions; production would use smooth sensitivity here.
-        self.accountant.charge(
+        self._accountant.charge(
             PrivacyBudget(req.epsilon, 0.0),
             purpose=purpose,
             subject=f"var:{sector_group}",
@@ -491,7 +503,7 @@ class SentryLinkPlatform:
         )
 
         def _persist_var(tx: StoreTx) -> None:
-            tx.save_budget(codec.encode_budget(self.accountant))
+            tx.save_budget(codec.encode_budget(self._accountant))
             tx.append_audit(entry)
 
         self._commit(_persist_var)
@@ -540,7 +552,7 @@ class SentryLinkPlatform:
             delta=delta,
             purpose=purpose,
         )
-        decision = self.policy.evaluate(req)
+        decision = self._policy.evaluate(req)
         decision.raise_if_denied()
         pairs = {oid: org_pairs[oid] for oid in decision.participants}
         if len(pairs) != len(decision.participants):
@@ -552,7 +564,7 @@ class SentryLinkPlatform:
             raise InvalidDataError(str(exc)) from exc
         # r ∈ [-1, 1]: add/remove sensitivity ≤ 2; Laplace keeps the release
         # informative at practical epsilon values.
-        self.accountant.charge(
+        self._accountant.charge(
             PrivacyBudget(req.epsilon, 0.0),
             purpose=purpose,
             subject=f"corr:{sector_group}",
@@ -583,7 +595,7 @@ class SentryLinkPlatform:
         )
 
         def _persist_corr(tx: StoreTx) -> None:
-            tx.save_budget(codec.encode_budget(self.accountant))
+            tx.save_budget(codec.encode_budget(self._accountant))
             tx.append_audit(entry)
 
         self._commit(_persist_corr)
@@ -638,10 +650,10 @@ class SentryLinkPlatform:
             delta=delta,
             purpose="privacy preview",
         )
-        decision = self.policy.evaluate(req)
+        decision = self._policy.evaluate(req)
         mechanism, sens = self._preview_spec(metric, len(decision.participants))
         remaining_before = max(
-            0.0, self.accountant.limit.epsilon - self.accountant.spent.epsilon
+            0.0, self._accountant.limit.epsilon - self._accountant.spent.epsilon
         )
         base: dict = {
             "allowed": False,
@@ -654,7 +666,7 @@ class SentryLinkPlatform:
             "estimated_cost": epsilon,
             "remaining_budget_before": remaining_before,
             "remaining_budget_after": remaining_before,
-            "accounting_regime": "rdp" if self.accountant.rdp_complete else "basic",
+            "accounting_regime": "rdp" if self._accountant.rdp_complete else "basic",
             "sensitivity": sens,
             "request_id": request_id,
             "governance": {
@@ -676,7 +688,7 @@ class SentryLinkPlatform:
             rdp = gaussian_rdp_cost(sens, gaussian_sigma(sens, epsilon, delta))
         else:
             rdp = None
-        admitted, regime = self.accountant.preview(cost, rdp)
+        admitted, regime = self._accountant.preview(cost, rdp)
         base.update(
             allowed=admitted,
             reason_code=None if admitted else "BUDGET_EXHAUSTED",
@@ -746,14 +758,14 @@ class SentryLinkPlatform:
 
     def budget_report(self) -> dict:
         return {
-            "limit_epsilon": self.accountant.limit.epsilon,
-            "limit_delta": self.accountant.limit.delta,
-            "spent_epsilon": self.accountant.spent.epsilon,
-            "spent_delta": self.accountant.spent.delta,
-            "remaining_epsilon": self.accountant.remaining.epsilon,
-            "remaining_delta": self.accountant.remaining.delta,
-            "events": len(self.accountant.events),
-            "rdp_epsilon_spent": self.accountant.rdp_epsilon(),
-            "rdp_complete": self.accountant.rdp_complete,
-            "ledger": self.accountant.events,
+            "limit_epsilon": self._accountant.limit.epsilon,
+            "limit_delta": self._accountant.limit.delta,
+            "spent_epsilon": self._accountant.spent.epsilon,
+            "spent_delta": self._accountant.spent.delta,
+            "remaining_epsilon": self._accountant.remaining.epsilon,
+            "remaining_delta": self._accountant.remaining.delta,
+            "events": len(self._accountant.events),
+            "rdp_epsilon_spent": self._accountant.rdp_epsilon(),
+            "rdp_complete": self._accountant.rdp_complete,
+            "ledger": self._accountant.events,
         }

@@ -11,6 +11,7 @@ synthetic; healthcare features are explicitly non-identifying.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from .usecases.synthetic import (
@@ -19,6 +20,19 @@ from .usecases.synthetic import (
     make_manufacturing_cohort,
     make_retail_cohort,
 )
+
+
+class DatasetSpec(ABC):
+    DESCRIPTION: str
+    FEATURES: tuple[tuple[str, str], ...]
+    LABEL: str
+
+    @classmethod
+    @abstractmethod
+    def generate(
+        cls, n_orgs: int = 4, n_per_org: int = 100, seed: int = 0
+    ) -> list[OrgDataset]:
+        raise NotImplementedError
 
 
 @dataclass(frozen=True)
@@ -92,7 +106,7 @@ def policy_for_domain(domain: str) -> VerticalPolicy:
     return VERTICALS.get(domain, DEFAULT_VERTICAL)
 
 
-class RetailDataset:
+class RetailDataset(DatasetSpec):
     """Synthetic retailer data: demand lift from promo/price/weather/traffic."""
 
     DESCRIPTION = (
@@ -114,7 +128,7 @@ class RetailDataset:
         return make_retail_cohort(n_orgs=n_orgs, n_per_org=n_per_org, seed=seed)
 
 
-class ManufacturingDataset:
+class ManufacturingDataset(DatasetSpec):
     """Synthetic plant data: quality defects from sensor/tooling features."""
 
     DESCRIPTION = (
@@ -136,7 +150,7 @@ class ManufacturingDataset:
         return make_manufacturing_cohort(n_orgs=n_orgs, n_per_org=n_per_org, seed=seed)
 
 
-class HealthcareDataset:
+class HealthcareDataset(DatasetSpec):
     """Synthetic hospital data: treatment response clusters.
 
     Explicitly non-identifying: age bands, severity bands, a biomarker index
@@ -162,7 +176,7 @@ class HealthcareDataset:
         return make_healthcare_cohort(n_orgs=n_orgs, n_per_org=n_per_org, seed=seed)
 
 
-DATASETS = {
+DATASETS: dict[str, type[DatasetSpec]] = {
     "retail": RetailDataset,
     "manufacturing": ManufacturingDataset,
     "healthcare": HealthcareDataset,

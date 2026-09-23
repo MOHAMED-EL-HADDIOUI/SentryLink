@@ -38,6 +38,7 @@ def check_bad_credentials():
 
 def check_non_member_access():
     from sentrylink.api.app import require_cohort_member
+    from sentrylink.errors import AuthorizationError
     from sentrylink.platform import SentryLinkPlatform
 
     p = SentryLinkPlatform()
@@ -47,6 +48,10 @@ def check_non_member_access():
     try:
         require_cohort_member(p, "g-in", "retail", outsider.org_id, outsider.api_key)
         return _result("non-member access blocked", False, "outsider authorized")
+    except AuthorizationError as exc:
+        if exc.code == "ORG_NOT_MEMBER":
+            return _result("non-member access blocked", True, "code=ORG_NOT_MEMBER")
+        return _result("non-member access blocked", False, f"code={exc.code}")
     except Exception as exc:  # noqa: BLE001 - asserting on the mapped status
         if getattr(exc, "status_code", None) == 403:
             return _result("non-member access blocked", True, "outsider got 403")

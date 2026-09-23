@@ -180,6 +180,15 @@ def test_rate_limit_distinct_from_budget():
         mod.PLATFORM = prev
 
 
+def test_privacy_review_clean_on_real_tree():
+    import sys
+
+    sys.path.insert(0, "scripts")
+    from privacy_review import review
+
+    assert review() == []
+
+
 def test_malformed_request_ids_regenerated():
     fresh, mod, prev = _fresh_client()
     try:
