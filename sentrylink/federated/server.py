@@ -8,9 +8,9 @@ import numpy as np
 
 from ..config import DEFAULT_DELTA, DEFAULT_EPSILON, UPDATE_CLIP
 from ..crypto.differential_privacy import gaussian_sigma
-from ..crypto.secure_aggregation import SecureAggregator
+from ..crypto.secure_aggregation import SecAggClient, SecAggServer, new_round_id
 from .client import FederatedClient
-from .model import LogisticModel, evaluate_sufficient_stats
+from .model import LogisticModel
 
 
 @dataclass
@@ -55,11 +55,13 @@ class FederatedServer:
             raise ValueError("duplicate org ids in roster")
 
         assert self.model is not None
-        round_id = SecureAggregator.new_round_id()
-        agg = SecureAggregator(round_id=round_id, roster=roster, dim=self.model.flat.shape[0])
+        round_id = new_round_id()
+        agg = SecAggServer(round_id=round_id, roster=roster, dim=self.model.flat.shape[0])
+        parties = {c.org_id: SecAggClient(c.org_id, round_id, roster, agg.dim) for c in clients}
 
-        for c in clients:
-            agg.client_register(c.org_id)
+        for oid, party in parties.items():
+            agg.register(oid, party.public_key)
+        keys = agg.public_keys()
 
         active = [c for c in clients if c.org_id not in drop]
         if not active:
@@ -68,12 +70,14 @@ class FederatedServer:
         deltas = {c.org_id: c.local_train(self.model, epochs=epochs) for c in active}
 
         for org_id, update in deltas.items():
-            agg.client_mask_and_send(org_id, update)
+            agg.receive(parties[org_id].mask_and_send(update, keys))
 
         dropped = [oid for oid in roster if oid in drop]
         for survivor in deltas:
             for d in dropped:
-                agg.client_reveal_seed(survivor, d)
+                agg.add_recovery_seed(
+                    survivor, d, parties[survivor].reveal_seed(d, keys[d])
+                )
 
         aggregate_sum = agg.finalize()
 
@@ -115,16 +119,32 @@ class FederatedServer:
 
     @staticmethod
     def _secure_eval(clients: list[FederatedClient], model: LogisticModel) -> dict:
-        """Pool additive sufficient stats across clients — per-client metrics
-        are never exposed, only the cohort totals."""
-        n_total = 0
-        loss_total = 0.0
-        correct_total = 0
+        """Cohort totals via a masked sub-round over client-side tallies.
+
+        Each client reduces its own rows to (n, loss_sum, n_correct) and only
+        the masked sum is opened — per-client tallies never cross the boundary
+        in the clear. Tallies skip L2 clipping (clip_bound=None): they are
+        already bounded counts, rescaling them would corrupt the sums.
+        """
+        if not clients:
+            return {
+                "n": 0,
+                "mean_loss": float("nan"),
+                "accuracy": float("nan"),
+                "n_correct": 0,
+            }
+        roster = [c.org_id for c in clients]
+        sub = SecAggServer(round_id=new_round_id(), roster=roster, dim=3)
+        parties = {c.org_id: SecAggClient(c.org_id, sub.round_id, roster, 3) for c in clients}
+        for oid, party in parties.items():
+            sub.register(oid, party.public_key)
+        keys = sub.public_keys()
         for c in clients:
-            n, loss_sum, correct = evaluate_sufficient_stats(model, c.x, c.y)
-            n_total += n
-            loss_total += loss_sum
-            correct_total += correct
+            sub.receive(parties[c.org_id].mask_and_send(c.eval_stats(model), keys, clip_bound=None))
+        total = sub.finalize()  # [n, loss_sum, n_correct]
+        n_total = int(round(float(total[0])))
+        loss_total = float(total[1])
+        correct_total = int(round(float(total[2])))
         return {
             "n": n_total,
             "mean_loss": loss_total / n_total if n_total else float("nan"),

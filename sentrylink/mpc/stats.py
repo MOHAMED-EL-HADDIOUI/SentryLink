@@ -3,18 +3,17 @@
 Model (semi-honest, 2 non-colluding compute nodes):
   - Each data-holding organization secret-shares its local aggregate vector
     across ComputeNodes (additive shares mod FIELD_P).
-  - Linear ops (sum, linear combination) run on shares with no interaction.
-  - Cross-organization products (needed for variance / correlation pooling)
-    use Beaver triples from a preprocessing dealer. In production replace
-    the dealer with OT-based triple generation or threshold HE; the interface
-    stays the same.
-  - Outputs are only opened after governance policy checks, and always pass
-    through differential privacy before leaving the platform.
+   - Linear ops (sum, linear combination) run on shares with no interaction.
+   - By design no served query needs cross-org products: each org reduces its
+     own rows to sufficient statistics (sums, sums of squares, xy tallies)
+     locally, and only those tallies are combined under shares. The protocol
+     is deliberately linear-only, so no triple generation machinery is needed.
+   - Outputs are only opened after governance policy checks, and always pass
+     through differential privacy before leaving the platform.
 """
 
 from __future__ import annotations
 
-import secrets
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -51,64 +50,6 @@ class ComputeNode:
 
     def get(self, query_id: str) -> Share:
         return self.shares[query_id]
-
-
-@dataclass
-class BeaverTriples:
-    """Preprocessed (a, b, c=ab) triples, share-encoded per node."""
-
-    a: dict[str, Share]
-    b: dict[str, Share]
-    c: dict[str, Share]
-    length: int
-
-
-class Dealer:
-    """Trusted preprocessing dealer (demo stand-in for OT / HE setup)."""
-
-    @staticmethod
-    def generate(node_ids: list[str], length: int) -> BeaverTriples:
-        a = [secrets.randbelow(FIELD_P) for _ in range(length)]
-        b = [secrets.randbelow(FIELD_P) for _ in range(length)]
-        c = [(ai * bi) % FIELD_P for ai, bi in zip(a, b)]
-        return BeaverTriples(
-            a=share_vector(a, node_ids),
-            b=share_vector(b, node_ids),
-            c=share_vector(c, node_ids),
-            length=length,
-        )
-
-
-def beaver_multiply(
-    x: dict[str, Share],
-    y: dict[str, Share],
-    triples: BeaverTriples,
-    node_ids: list[str],
-) -> dict[str, Share]:
-    """Element-wise product of two shared vectors via Beaver triples.
-
-    Only e = x - a and f = y - b are opened; x and y themselves never are.
-    """
-    length = len(x[node_ids[0]].values)
-    if triples.length < length:
-        raise ValueError("not enough beaver triples")
-
-    x_open = reconstruct([x[n] for n in node_ids])
-    y_open = reconstruct([y[n] for n in node_ids])
-    a_open = reconstruct([triples.a[n] for n in node_ids])
-    b_open = reconstruct([triples.b[n] for n in node_ids])
-    e = [(x_open[i] - a_open[i]) % FIELD_P for i in range(length)]
-    f = [(y_open[i] - b_open[i]) % FIELD_P for i in range(length)]
-
-    z: dict[str, Share] = {}
-    for node_id in node_ids:
-        yi, ai, ci = y[node_id], triples.a[node_id], triples.c[node_id]
-        vals = tuple(
-            (ci.values[i] + e[i] * yi.values[i] + f[i] * ai.values[i]) % FIELD_P
-            for i in range(length)
-        )
-        z[node_id] = Share(node_id, vals)
-    return z
 
 
 def elementwise_add(x: dict[str, Share], y: dict[str, Share], node_ids: list[str]) -> dict[str, Share]:

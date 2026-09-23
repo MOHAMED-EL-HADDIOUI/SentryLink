@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..config import ROUNDS_DEFAULT_LR
-from .model import LogisticModel, sigmoid
+from .model import LogisticModel, evaluate_sufficient_stats, sigmoid
 
 
 @dataclass
@@ -51,3 +51,14 @@ class FederatedClient:
                 grad[1:] = err * xi + self.l2 * w[1:]
                 w -= self.lr * grad
         return w - global_model.flat
+
+    def eval_stats(self, global_model: LogisticModel) -> np.ndarray:
+        """Local (n, sum_log_loss, n_correct) as a float vector for masked pooling.
+
+        Computed client-side so per-client tallies never cross the boundary
+        in the clear — only their masked sum is ever opened.
+        """
+        if global_model.dim != self.dim:
+            raise ValueError("model dim mismatch")
+        n, loss_sum, correct = evaluate_sufficient_stats(global_model, self.x, self.y)
+        return np.array([float(n), float(loss_sum), float(correct)], dtype=np.float64)

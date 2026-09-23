@@ -1,14 +1,12 @@
 import numpy as np
 
 from sentrylink.mpc.stats import (
-    Dealer,
-    beaver_multiply,
     run_correlation,
     run_histogram,
     run_variance,
     quantize_ints,
 )
-from sentrylink.crypto.secret_sharing import reconstruct, share_vector
+from sentrylink.crypto.secret_sharing import share_vector
 
 NODES = ["node-a", "node-b"]
 
@@ -64,19 +62,6 @@ def test_correlation_matches_numpy():
     got = run_correlation(pairs, NODES)
     expected = float(np.corrcoef(x, y)[0, 1])
     assert abs(got - expected) < 0.02
-
-
-def test_beaver_multiply_correct():
-    rng = np.random.default_rng(5)
-    p_vals = [int(v) for v in rng.integers(0, 10**6, size=8)]
-    q_vals = [int(v) for v in rng.integers(0, 10**6, size=8)]
-    xs = share_vector(p_vals, NODES)
-    ys = share_vector(q_vals, NODES)
-    triples = Dealer.generate(NODES, length=8)
-    zs = beaver_multiply(xs, ys, triples, NODES)
-    opened = reconstruct([zs[n] for n in NODES])
-    expected = [(a * b) % ((1 << 127) - 1) for a, b in zip(p_vals, q_vals)]
-    assert opened == expected
 
 
 def test_quantize_ints():

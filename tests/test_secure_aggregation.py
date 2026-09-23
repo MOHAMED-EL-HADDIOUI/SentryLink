@@ -1,11 +1,48 @@
-import numpy as np
+import dataclasses
 
-from sentrylink.crypto.secure_aggregation import SecureAggregator, clip_l2, quantize, dequantize
+import numpy as np
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+from sentrylink.crypto.secure_aggregation import (
+    SecAggClient,
+    SecAggServer,
+    clip_l2,
+    dequantize,
+    new_round_id,
+    quantize,
+)
 from sentrylink.config import UPDATE_CLIP
 
 
-def _make_round(roster, dim, round_id="r1"):
-    return SecureAggregator(round_id=round_id, roster=roster, dim=dim)
+def _make_round(roster, dim, round_id=None):
+    round_id = round_id or new_round_id()
+    server = SecAggServer(round_id=round_id, roster=roster, dim=dim)
+    clients = {oid: SecAggClient(oid, round_id, roster, dim) for oid in roster}
+    for oid, c in clients.items():
+        server.register(oid, c.public_key)
+    return server, clients
+
+
+def _contains_privkey(obj, _seen=None):
+    """True if any X25519 private key is reachable from obj."""
+    _seen = _seen if _seen is not None else set()
+    if id(obj) in _seen:
+        return False
+    _seen.add(id(obj))
+    if isinstance(obj, X25519PrivateKey):
+        return True
+    if isinstance(obj, dict):
+        return any(_contains_privkey(v, _seen) for v in obj.values())
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return any(_contains_privkey(v, _seen) for v in obj)
+    if hasattr(obj, "__dataclass_fields__"):
+        return any(
+            _contains_privkey(getattr(obj, f.name), _seen)
+            for f in dataclasses.fields(obj)
+        )
+    if hasattr(obj, "__dict__"):
+        return _contains_privkey(vars(obj), _seen)
+    return False
 
 
 def test_quantize_roundtrip():
@@ -18,28 +55,20 @@ def test_quantize_roundtrip():
 def test_clip_l2():
     v = np.array([3.0, 4.0])  # norm 5
     c = clip_l2(v, bound=1.0)
-    assert np.linalg.norm(c) == pytest_approx(1.0)
-
-
-def pytest_approx(x, rel=1e-6):
-    class A:
-        def __eq__(self, other):
-            return abs(other - x) <= rel * max(1.0, abs(x))
-    return A()
+    assert abs(np.linalg.norm(c) - 1.0) <= 1e-6
 
 
 def test_masks_cancel_without_dropout():
     roster = ["a", "b", "c"]
     dim = 8
-    agg = _make_round(roster, dim, round_id="t1")
+    server, clients = _make_round(roster, dim)
     rng = np.random.default_rng(0)
     updates = {oid: rng.normal(size=dim) for oid in roster}
-    for oid in roster:
-        agg.client_register(oid)
+    keys = server.public_keys()
     for oid, u in updates.items():
-        agg.client_mask_and_send(oid, u)
+        server.receive(clients[oid].mask_and_send(u, keys))
 
-    got = agg.finalize()
+    got = server.finalize()
     expected = dequantize(sum((quantize(clip_l2(u)) for u in updates.values()), np.zeros(dim, dtype=np.int64)))
     np.testing.assert_allclose(got, expected, atol=1e-9)
 
@@ -47,18 +76,19 @@ def test_masks_cancel_without_dropout():
 def test_masks_cancel_with_dropout():
     roster = ["a", "b", "c", "d"]
     dim = 16
-    agg = _make_round(roster, dim, round_id="t2")
+    server, clients = _make_round(roster, dim)
     rng = np.random.default_rng(1)
     updates = {oid: rng.normal(size=dim) for oid in roster}
-    for oid in roster:
-        agg.client_register(oid)
+    keys = server.public_keys()
     active = ["a", "b", "c"]
     for oid in active:
-        agg.client_mask_and_send(oid, updates[oid])
+        server.receive(clients[oid].mask_and_send(updates[oid], keys))
     for survivor in active:
-        agg.client_reveal_seed(survivor, "d")
+        server.add_recovery_seed(
+            survivor, "d", clients[survivor].reveal_seed("d", keys["d"])
+        )
 
-    got = agg.finalize()
+    got = server.finalize()
     expected_vec = sum(
         (quantize(clip_l2(updates[oid])) for oid in active), np.zeros(dim, dtype=np.int64)
     )
@@ -67,12 +97,42 @@ def test_masks_cancel_with_dropout():
 
 def test_updates_clipped_before_masking():
     roster = ["a", "b"]
-    agg = _make_round(roster, 4, round_id="t3")
-    for oid in roster:
-        agg.client_register(oid)
+    server, clients = _make_round(roster, 4)
+    keys = server.public_keys()
     big = np.full(4, 100.0)
-    agg.client_mask_and_send("a", big)
-    agg.client_mask_and_send("b", np.zeros(4))
-    got = agg.finalize()
+    server.receive(clients["a"].mask_and_send(big, keys))
+    server.receive(clients["b"].mask_and_send(np.zeros(4), keys))
+    got = server.finalize()
     clipped = clip_l2(big, UPDATE_CLIP)
     np.testing.assert_allclose(got, clipped, atol=1e-6)
+
+
+def test_server_holds_no_private_key_material():
+    """Trust boundary, enforced: private keys live client-side only."""
+    roster = ["a", "b", "c"]
+    server, clients = _make_round(roster, 4)
+    assert all(
+        isinstance(c._private_key, X25519PrivateKey) for c in clients.values()
+    )
+    rng = np.random.default_rng(3)
+    keys = server.public_keys()
+    for oid, c in clients.items():
+        update = rng.normal(size=4)
+        contrib = c.mask_and_send(update, keys)
+        # masks are actually applied: the server's view differs from our update
+        assert not np.array_equal(contrib.masked_update, quantize(clip_l2(update)))
+        server.receive(contrib)
+    server.add_recovery_seed("a", "b", clients["a"].reveal_seed("b", keys["b"]))
+    assert not _contains_privkey(server)
+
+
+def test_server_rejects_non_roster_and_bad_dims():
+    server, clients = _make_round(["a", "b"], 4)
+    import pytest
+
+    with pytest.raises(PermissionError):
+        server.register("mallory", clients["a"].public_key)
+    with pytest.raises(PermissionError):
+        SecAggClient("mallory", server.round_id, ["a", "b"], 4)
+    with pytest.raises(ValueError):
+        clients["a"].mask_and_send(np.zeros(7), server.public_keys())

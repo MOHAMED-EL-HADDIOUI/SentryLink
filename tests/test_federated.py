@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from sentrylink.federated.client import FederatedClient
 from sentrylink.federated.model import LogisticModel, evaluate_sufficient_stats
@@ -63,3 +64,27 @@ def test_eval_stats_are_pooled_not_per_client():
     stats = FederatedServer._secure_eval(clients, LogisticModel.zeros(4))
     assert stats["n"] == 300
     assert "per_client" not in stats
+
+
+def test_secure_eval_matches_direct_tally_sums():
+    # the masked eval sub-round round-trips client tallies losslessly
+    orgs = make_retail_cohort(n_orgs=3, n_per_org=100, seed=2)
+    clients = _clients(orgs, [o.org_id for o in orgs])
+    model = LogisticModel.zeros(4)
+    stats = FederatedServer._secure_eval(clients, model)
+    n_exp, loss_exp, correct_exp = 0, 0.0, 0
+    for c in clients:
+        n, loss, correct = evaluate_sufficient_stats(model, c.x, c.y)
+        n_exp += n
+        loss_exp += loss
+        correct_exp += correct
+    assert stats["n"] == n_exp
+    assert stats["n_correct"] == correct_exp
+    assert stats["mean_loss"] == pytest.approx(loss_exp / n_exp)
+    assert stats["accuracy"] == pytest.approx(correct_exp / n_exp)
+
+
+def test_secure_eval_empty_cohort():
+    stats = FederatedServer._secure_eval([], LogisticModel.zeros(4))
+    assert stats["n"] == 0
+    assert np.isnan(stats["accuracy"])

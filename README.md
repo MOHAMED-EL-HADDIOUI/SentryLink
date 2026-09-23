@@ -46,7 +46,7 @@ flowchart LR
     C[Org C rows] -->|local train / bucket| P
     P --> G[Governance: consent · k≥3 floor · ε/δ accountant · hash-chained audit]
     G --> S[Secure aggregation: X25519 pairwise PRG masks · dropout recovery]
-    S --> M[MPC compute: additive shares mod 2^127−1 · Beaver triples]
+    S --> M[MPC compute: additive shares mod 2^127−1 · linear-only ops]
     M --> D[Differential privacy: Laplace on aggregates · Gaussian on FL models]
     D --> R([Released insight — aggregate only])
 ```
@@ -60,8 +60,9 @@ The privacy stack, in one breath:
    cancel in the sum: the server learns *only the aggregate*. Survivors reveal
    seeds for dropped peers so the sum stays well-defined.
 3. **Secure MPC** — histograms, variance, and correlation run as **additive
-   secret shares** across two non-colluding compute nodes; products use
-   **Beaver triples** from a preprocessing dealer.
+   secret shares** across two non-colluding compute nodes. By design no query
+   needs cross-org products: each org reduces its own rows to sufficient
+   statistics locally, so the protocol stays linear-only.
 4. **Differential privacy** — every released number is perturbed: **Laplace**
    (pure ε-DP) for aggregates, **Gaussian** ((ε, δ)-DP) for federated updates,
    all tracked by a privacy accountant.
@@ -131,7 +132,7 @@ sentrylink/
     secure_aggregation.py # X25519 pairwise masking + dropout recovery
     differential_privacy.py # Gaussian/Laplace mechanisms, budgets, accountant
   mpc/
-    stats.py              # compute nodes, Beaver triples, histogram/var/corr
+    stats.py              # compute nodes, additive-only histogram/var/corr
   federated/
     model.py              # logistic regression + sufficient stats
     client.py             # local SGD → delta

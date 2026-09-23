@@ -1,7 +1,5 @@
 from .stats import (
     ComputeNode,
-    Dealer,
-    beaver_multiply,
     run_correlation,
     run_histogram,
     run_mean,
@@ -10,8 +8,6 @@ from .stats import (
 
 __all__ = [
     "ComputeNode",
-    "Dealer",
-    "beaver_multiply",
     "run_histogram",
     "run_mean",
     "run_variance",

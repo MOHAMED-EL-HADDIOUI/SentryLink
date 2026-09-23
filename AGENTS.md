@@ -13,7 +13,7 @@
 - `sentrylink/config.py` holds coupled crypto/DP constants — `FIELD_P = 2**127-1`, `QUANT_SCALE = 1e6`, `MASK_BOUND = 2**40` (int64-safe), `UPDATE_CLIP = 1.0`, `MAX_ORG_CONTRIB = 100.0`. Changing any one breaks masking/DP sensitivity assumptions elsewhere.
 - Privacy split: **Laplace (pure ε-DP)** for `histogram`/`variance`/`correlation` (accountant charged with `delta=0`); **Gaussian ((ε,δ)-DP)** only for federated rounds. Keep this split when adding releases.
 - Accounting is RDP moments-based: every `accountant.charge` site must pass an `rdp=` cost (`laplace_rdp_cost` / `gaussian_rdp_cost`), or enforcement silently falls back to basic composition from the first cost-less event on (`rdp_complete=False`). FL rounds read the applied noise from `RoundResult.dp_sigma` — keep that field truthful.
-- MPC is 2 non-colluding nodes (`NODE_IDS` in `platform.py`); collusion is explicitly out of scope. Beaver triples come from a preprocessing dealer (demo-only, not malicious-secure).
+- MPC is 2 non-colluding nodes (`NODE_IDS` in `platform.py`); collusion is explicitly out of scope. The protocol is deliberately linear-only (orgs pre-reduce to sufficient statistics) — there is no triple machinery; don't reintroduce products without a no-leak design.
 - `api/app.py::PLATFORM` is a module-level in-memory singleton — no DB. State (registry, servers, audit, accountant) resets on process restart; `GET /federated/model` 404s until a round has run for that `sector_group:domain` key.
 
 ## Governance gotchas (cause most test/API failures)
@@ -29,6 +29,8 @@
 ## Federated / MPC / test quirks
 - FL round infers model dim from the first client (`FederatedServer(dim=clients[0].dim)`); all clients must share that feature dim or `local_train` raises `"model dim mismatch"`. Released `weights` length is `dim+1` (bias + features). Roster with duplicate org ids is rejected.
 - Dropout recovery: still pass the **full** clients dict and list dropouts in `drop=[org_id]` — the platform handles seed reveal internally (`demo.py` pattern). `result.participants` lists survivors only.
+- Trust boundary is structural: `SecAggClient` owns its X25519 private key; `SecAggServer` must never hold key material (`tests/test_secure_aggregation.py` enforces this by walking the server object). Keep all masking client-side.
+- FL eval stats are pooled through a masked dim-3 sub-round (`clip_bound=None` — tallies must not be L2-clipped). `FederatedServer._secure_eval` takes the same `(clients, model)` args; per-client tallies never cross in the clear.
 - `mean` is **not** a servable metric: it was removed from `ALLOWED_METRICS` (no `platform.mean()` / `/queries/mean` ever existed). `mpc/stats.py::run_mean` remains only as an unused pooled helper.
 - DP noise is unseeded per call: assert on types/ranges (`isinstance`, `>= 0`, `[-1, 1]`) or deterministic `raw_value`, never exact noisy values.
 - `api/app.py::PLATFORM` is a process-global singleton — API tests must swap in a fresh `SentryLinkPlatform` per test and restore it after (see `tests/test_api.py::client` fixture), or state leaks across tests.

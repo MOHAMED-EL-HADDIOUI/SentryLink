@@ -199,7 +199,7 @@ def main() -> None:
     print(
         "Raw rows never leave an organization.\n"
         "• Federated learning: pairwise-masked updates (X25519 + PRG), server sees sums only\n"
-        "• MPC: additive secret shares across 2 non-colluding nodes + Beaver triples\n"
+        "• MPC: additive secret shares across 2 non-colluding nodes (linear-only)\n"
         "• Differential privacy: Laplace on aggregates (pure ε), Gaussian on FL models\n"
         "• Governance: consent policies, k≥3 cohort floor, hash-chained audit log\n"
     )

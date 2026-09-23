@@ -1,5 +1,10 @@
 """Pairwise-mask secure aggregation (Bonawitz-style) for federated updates.
 
+Trust boundaries are enforced by construction, not just documented:
+  - SecAggClient holds its own X25519 private key. It never leaves the client.
+  - SecAggServer sees only public keys, masked updates, and revealed
+    dropout-recovery seeds. It holds no private key material.
+
 Flow per round:
   1. Server announces the roster of participating organization ids.
   2. Each client derives an ephemeral X25519 keypair, exchanges public keys
@@ -32,6 +37,10 @@ from ..config import QUANT_SCALE, UPDATE_CLIP
 from .prg import int_masks
 
 
+def new_round_id() -> str:
+    return secrets.token_hex(8)
+
+
 def quantize(vec: np.ndarray) -> np.ndarray:
     return np.rint(np.asarray(vec, dtype=np.float64) * QUANT_SCALE).astype(np.int64)
 
@@ -62,83 +71,111 @@ def _pairwise_seed(
 
 
 @dataclass
-class ClientContext:
-    org_id: str
-    private_key: X25519PrivateKey
-    public_raw: bytes
-
-
-@dataclass
 class Contribution:
     org_id: str
     masked_update: np.ndarray  # int64
     public_key: bytes
 
 
-@dataclass
-class SecureAggregator:
-    """Server-side orchestrator for one secure-aggregation round."""
+class SecAggClient:
+    """One organization's side of a round. Owns its private key exclusively."""
 
-    round_id: str
-    roster: list[str]
-    dim: int
-    _privates: dict[str, ClientContext] = field(default_factory=dict)
-    _contributions: dict[str, Contribution] = field(default_factory=dict)
-    _revealed_seeds: dict[tuple[str, str], bytes] = field(default_factory=dict)
-
-    # ---- client side -------------------------------------------------
-    def client_register(self, org_id: str) -> bytes:
-        if org_id not in self.roster:
+    def __init__(self, org_id: str, round_id: str, roster: list[str], dim: int):
+        if org_id not in roster:
             raise PermissionError(f"{org_id} not in roster")
-        priv = X25519PrivateKey.generate()
-        pub = priv.public_key().public_bytes_raw()
-        self._privates[org_id] = ClientContext(org_id, priv, pub)
-        return pub
+        self.org_id = org_id
+        self.round_id = round_id
+        self.roster = list(roster)
+        self.dim = dim
+        self._private_key = X25519PrivateKey.generate()
+        self.public_key: bytes = self._private_key.public_key().public_bytes_raw()
 
-    def public_keys(self) -> dict[str, bytes]:
-        return {oid: ctx.public_raw for oid, ctx in self._privates.items()}
+    def mask_and_send(
+        self,
+        update: np.ndarray,
+        peer_keys: dict[str, bytes],
+        *,
+        clip_bound: float | None = UPDATE_CLIP,
+    ) -> Contribution:
+        """Quantize (optionally L2-clip), mask, and package our update.
 
-    def client_mask_and_send(self, org_id: str, update: np.ndarray) -> Contribution:
-        ctx = self._privates.get(org_id)
-        if ctx is None:
-            raise PermissionError(f"{org_id} has not registered a key")
-        keys = self.public_keys()
-        if len(keys) != len(self.roster):
+        Pass clip_bound=None for already-bounded payloads (e.g. eval tallies)
+        that must not be rescaled.
+        """
+        if set(peer_keys) != set(self.roster):
             raise RuntimeError("waiting for all roster keys before masking")
-
-        clipped = clip_l2(np.asarray(update, dtype=np.float64))
-        q = quantize(clipped)
+        v = np.asarray(update, dtype=np.float64)
+        if clip_bound is not None:
+            v = clip_l2(v, clip_bound)
+        q = quantize(v)
         if q.shape != (self.dim,):
             raise ValueError(f"update dim {q.shape} != ({self.dim},)")
 
         mask = np.zeros(self.dim, dtype=np.int64)
         for peer in self.roster:
-            if peer == org_id:
+            if peer == self.org_id:
                 continue
-            seed = _pairwise_seed(ctx.private_key, keys[peer], self.round_id, org_id, peer)
+            seed = _pairwise_seed(
+                self._private_key, peer_keys[peer], self.round_id, self.org_id, peer
+            )
             stream = int_masks(seed, self.dim)
-            if org_id < peer:
+            if self.org_id < peer:
                 mask = mask + stream
             else:
                 mask = mask - stream
-        contrib = Contribution(org_id, q + mask, ctx.public_raw)
-        self._contributions[org_id] = contrib
-        return contrib
+        return Contribution(self.org_id, q + mask, self.public_key)
 
-    def client_reveal_seed(self, org_id: str, dropped_id: str) -> bytes:
-        """Survivor releases its pairwise seed with a dropped peer (recovery)."""
-        ctx = self._privates.get(org_id)
-        if ctx is None:
-            raise PermissionError(f"{org_id} has not registered")
+    def reveal_seed(self, dropped_id: str, dropped_public_raw: bytes) -> bytes:
+        """Release our pairwise seed with a dropped peer (dropout recovery)."""
         if dropped_id not in self.roster:
             raise ValueError("dropped id not in roster")
-        seed = _pairwise_seed(
-            ctx.private_key, self._privates[dropped_id].public_raw, self.round_id, org_id, dropped_id
+        if dropped_id == self.org_id:
+            raise ValueError("cannot reveal a seed with ourselves")
+        return _pairwise_seed(
+            self._private_key, dropped_public_raw, self.round_id, self.org_id, dropped_id
         )
-        self._revealed_seeds[tuple(sorted((org_id, dropped_id)))] = seed
-        return seed
 
-    # ---- server side -------------------------------------------------
+
+@dataclass
+class SecAggServer:
+    """Coordinator side of a round.
+
+    Holds public keys, masked contributions, and revealed recovery seeds —
+    never private key material.
+    """
+
+    round_id: str
+    roster: list[str]
+    dim: int
+    _keys: dict[str, bytes] = field(default_factory=dict)
+    _contributions: dict[str, Contribution] = field(default_factory=dict)
+    _revealed_seeds: dict[tuple[str, str], bytes] = field(default_factory=dict)
+
+    def register(self, org_id: str, public_key: bytes) -> None:
+        if org_id not in self.roster:
+            raise PermissionError(f"{org_id} not in roster")
+        # Fail fast on malformed keys rather than at seed-derivation time.
+        X25519PublicKey.from_public_bytes(bytes(public_key))
+        self._keys[org_id] = bytes(public_key)
+
+    def public_keys(self) -> dict[str, bytes]:
+        return dict(self._keys)
+
+    def receive(self, contrib: Contribution) -> None:
+        if contrib.org_id not in self.roster:
+            raise PermissionError(f"{contrib.org_id} not in roster")
+        q = np.asarray(contrib.masked_update, dtype=np.int64)
+        if q.shape != (self.dim,):
+            raise ValueError(f"contribution dim {q.shape} != ({self.dim},)")
+        self._contributions[contrib.org_id] = Contribution(
+            contrib.org_id, q, bytes(contrib.public_key)
+        )
+
+    def add_recovery_seed(self, survivor: str, dropped: str, seed: bytes) -> None:
+        if survivor not in self.roster or dropped not in self.roster:
+            raise ValueError("survivor/dropped must be roster members")
+        self._revealed_seeds[tuple(sorted((survivor, dropped)))] = bytes(seed)
+
     def finalize(self) -> np.ndarray:
         """Return the summed (dequantized) aggregate from received contributions."""
         if not self._contributions:
@@ -170,7 +207,3 @@ class SecureAggregator:
     @property
     def participants(self) -> list[str]:
         return sorted(self._contributions)
-
-    @staticmethod
-    def new_round_id() -> str:
-        return secrets.token_hex(8)
