@@ -37,11 +37,12 @@ def _pytest_section() -> dict:
         text=True,
         cwd=str(ROOT),
     )
-    tail = (proc.stdout + proc.stderr).strip().splitlines()
-    last = tail[-1] if tail else ""
-    passed = int(m.group(1)) if (m := re.search(r"(\d+) passed", last)) else 0
-    failed = int(m.group(1)) if (m := re.search(r"(\d+) failed", last)) else 0
-    skipped = int(m.group(1)) if (m := re.search(r"(\d+) skipped", last)) else 0
+    # NOTE: search the whole output, not the last line — warnings and
+    # plugin chatter on stderr can trail the summary line.
+    text = proc.stdout + proc.stderr
+    passed = int(m.group(1)) if (m := re.search(r"(\d+) passed", text)) else 0
+    failed = int(m.group(1)) if (m := re.search(r"(\d+) failed", text)) else 0
+    skipped = int(m.group(1)) if (m := re.search(r"(\d+) skipped", text)) else 0
     if proc.returncode != 0 and passed == 0 and failed == 0:
         failed = 1
     return {"passed": passed, "failed": failed, "skipped": skipped}
