@@ -1,5 +1,17 @@
 import pytest
 
+from sentrylink.errors import (
+    CohortTooSmallError,
+    ConsentDeniedError,
+    DomainMismatchError,
+    EpsilonTooHighError,
+    GovernanceError,
+    HealthcareCohortTooSmallError,
+    HealthcareEpsilonTooHighError,
+    InvalidDataError,
+    QueryNotAllowedError,
+    ScopeMismatchError,
+)
 from sentrylink.governance.audit import AuditLog
 from sentrylink.governance.policy import ConsentPolicy, PolicyEngine, QueryRequest
 from sentrylink.governance.registry import Registry
@@ -88,3 +100,93 @@ def test_platform_join_and_budget():
     assert p.audit.verify_chain()
     report = p.budget_report()
     assert report["spent_epsilon"] == 0.0
+
+
+def _dec(engine, metric="histogram", group="g1", domain="retail", epsilon=1.0):
+    return engine.evaluate(
+        QueryRequest(metric=metric, sector_group=group, domain=domain, epsilon=epsilon)
+    )
+
+
+def test_decision_codes_cohort_floor():
+    reg = _registry_with(n=2)
+    eng = PolicyEngine(reg)
+    for oid in ["o0", "o1"]:
+        eng.set_policy(oid, ConsentPolicy.default())
+    dec = _dec(eng)
+    assert dec.code == "COHORT_TOO_SMALL"
+    with pytest.raises(CohortTooSmallError):
+        dec.raise_if_denied()
+    with pytest.raises(PermissionError):  # back-compat: still a PermissionError
+        dec.raise_if_denied()
+
+
+def test_decision_codes_unknown_metric_and_scope():
+    reg = _registry_with(n=4)
+    eng = PolicyEngine(reg)
+    for i in range(4):
+        eng.set_policy(f"o{i}", ConsentPolicy.default())
+    dec = _dec(eng, metric="raw_export")
+    assert dec.code == "QUERY_NOT_ALLOWED"
+    with pytest.raises(QueryNotAllowedError):
+        dec.raise_if_denied()
+    assert _dec(eng, group="nope").code == "SECTOR_MISMATCH"
+    with pytest.raises(ScopeMismatchError):
+        _dec(eng, group="nope").raise_if_denied()
+    assert _dec(eng, domain="nope").code == "DOMAIN_MISMATCH"
+    with pytest.raises(DomainMismatchError):
+        _dec(eng, domain="nope").raise_if_denied()
+
+
+def test_decision_codes_consent_and_epsilon():
+    reg = _registry_with(n=3)
+    eng = PolicyEngine(reg)
+    for i in range(3):
+        eng.set_policy(f"o{i}", ConsentPolicy(allowed_metrics=frozenset()))
+    dec = _dec(eng)
+    assert dec.code == "CONSENT_REQUIRED"
+    with pytest.raises(ConsentDeniedError):
+        dec.raise_if_denied()
+
+    eng2 = PolicyEngine(_registry_with(n=3))
+    for i in range(3):
+        eng2.set_policy(
+            f"o{i}",
+            ConsentPolicy(
+                allowed_metrics=frozenset({"histogram"}), max_epsilon_per_query=1.0
+            ),
+        )
+    dec = _dec(eng2, epsilon=9.0)
+    assert dec.code == "EPSILON_TOO_HIGH"
+    with pytest.raises(EpsilonTooHighError):
+        dec.raise_if_denied()
+
+
+def test_decision_codes_healthcare_variants():
+    from sentrylink.governance.policy import default_policy_for
+
+    reg = Registry()
+    for i in range(3):
+        reg.register(name=f"H{i}", domain="healthcare", sector_group="hg", org_id=f"h{i}")
+    eng = PolicyEngine(reg)
+    for i in range(3):
+        eng.set_policy(f"h{i}", default_policy_for(reg.get(f"h{i}")))
+    dec = _dec(eng, group="hg", domain="healthcare")
+    assert dec.code == "HEALTHCARE_COHORT_TOO_SMALL"
+    with pytest.raises(HealthcareCohortTooSmallError):
+        dec.raise_if_denied()
+    assert issubclass(HealthcareCohortTooSmallError, GovernanceError)
+    assert issubclass(HealthcareEpsilonTooHighError, GovernanceError)
+    assert issubclass(InvalidDataError, ValueError)
+
+
+def test_allowed_decision_carries_snapshot():
+    reg = _registry_with(n=3)
+    eng = PolicyEngine(reg)
+    for i in range(3):
+        eng.set_policy(f"o{i}", ConsentPolicy.default())
+    dec = _dec(eng)
+    assert dec.allowed and dec.code is None
+    assert dec.policy_snapshot["floor_required"] == 3
+    assert dec.policy_snapshot["candidates"] == 3
+    assert dec.policy_snapshot["epsilon_cap_min"] == 25.0

@@ -9,6 +9,7 @@ import numpy as np
 from ..config import DEFAULT_DELTA, DEFAULT_EPSILON, UPDATE_CLIP
 from ..crypto.differential_privacy import gaussian_sigma
 from ..crypto.secure_aggregation import SecAggClient, SecAggServer, new_round_id
+from ..errors import DuplicateRosterError, ModelDimensionMismatchError, ProtocolError
 from .client import FederatedClient
 from .model import LogisticModel
 
@@ -24,6 +25,7 @@ class RoundResult:
     dp_applied: bool
     epsilon_used: float
     dp_sigma: float = 0.0  # Gaussian noise scale actually applied (0 when no DP)
+    delta_used: float = DEFAULT_DELTA
 
 
 @dataclass
@@ -36,7 +38,9 @@ class FederatedServer:
         if self.model is None:
             self.model = LogisticModel.zeros(self.dim)
         elif self.model.dim != self.dim:
-            raise ValueError("model dim mismatch")
+            raise ModelDimensionMismatchError(
+                f"model dim {self.model.dim} != server dim {self.dim}"
+            )
 
     def run_round(
         self,
@@ -52,7 +56,7 @@ class FederatedServer:
         drop = drop or []
         roster = [c.org_id for c in clients]
         if len(set(roster)) != len(roster):
-            raise ValueError("duplicate org ids in roster")
+            raise DuplicateRosterError("duplicate org ids in roster")
 
         assert self.model is not None
         round_id = new_round_id()
@@ -65,7 +69,7 @@ class FederatedServer:
 
         active = [c for c in clients if c.org_id not in drop]
         if not active:
-            raise RuntimeError("no active clients in round")
+            raise ProtocolError("no active clients in round")
 
         deltas = {c.org_id: c.local_train(self.model, epochs=epochs) for c in active}
 
@@ -113,6 +117,7 @@ class FederatedServer:
             dp_applied=dp_applied,
             epsilon_used=eps_used,
             dp_sigma=dp_sigma,
+            delta_used=delta,
         )
         self.history.append(result)
         return result
@@ -132,6 +137,12 @@ class FederatedServer:
                 "mean_loss": float("nan"),
                 "accuracy": float("nan"),
                 "n_correct": 0,
+                "evaluation": {
+                    "mechanism": "masked_sum",
+                    "clip_bound": None,
+                    "lossless_pre_dp": True,
+                    "dp_applied": False,
+                },
             }
         roster = [c.org_id for c in clients]
         sub = SecAggServer(round_id=new_round_id(), roster=roster, dim=3)
@@ -150,4 +161,12 @@ class FederatedServer:
             "mean_loss": loss_total / n_total if n_total else float("nan"),
             "accuracy": correct_total / n_total if n_total else float("nan"),
             "n_correct": correct_total,
+            # Honest runtime metadata: tallies are masked-summed exactly
+            # (never clipped) and released WITHOUT DP noise.
+            "evaluation": {
+                "mechanism": "masked_sum",
+                "clip_bound": None,
+                "lossless_pre_dp": True,
+                "dp_applied": False,
+            },
         }

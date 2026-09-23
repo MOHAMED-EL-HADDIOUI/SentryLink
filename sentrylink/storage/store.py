@@ -164,6 +164,7 @@ class _SQLiteTx(StoreTx):
                 sector_group=org["sector_group"],
                 api_key_hash=org.get("api_key_hash", ""),
                 key_algo=org.get("key_algo", ""),
+                key_salt=org.get("key_salt", ""),
                 active=bool(org.get("active", True)),
             )
         )
@@ -217,6 +218,7 @@ class _SQLiteTx(StoreTx):
                 dp_applied=bool(round["dp_applied"]),
                 epsilon_used=float(round["epsilon_used"]),
                 dp_sigma=float(round.get("dp_sigma", 0.0)),
+                delta_used=float(round.get("delta_used", 1e-5)),
             )
         )
 
@@ -264,6 +266,7 @@ class SQLiteStateStore(StateStore):
                     "sector_group": r.sector_group,
                     "api_key_hash": r.api_key_hash,
                     "key_algo": r.key_algo,
+                    "key_salt": r.key_salt,
                     "active": r.active,
                 }
                 for r in s.query(OrgRow).order_by(OrgRow.org_id).all()
@@ -313,6 +316,7 @@ class SQLiteStateStore(StateStore):
                         "dp_applied": r.dp_applied,
                         "epsilon_used": r.epsilon_used,
                         "dp_sigma": r.dp_sigma,
+                        "delta_used": r.delta_used,
                     }
                 )
             audit = [dict(r.entry) for r in s.query(AuditRow).order_by(AuditRow.seq).all()]

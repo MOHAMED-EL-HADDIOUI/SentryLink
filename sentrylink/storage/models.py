@@ -35,6 +35,7 @@ class OrgRow(Base):
     sector_group: Mapped[str] = mapped_column(Text, nullable=False)
     api_key_hash: Mapped[str] = mapped_column(Text, nullable=False, default="")
     key_algo: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    key_salt: Mapped[str] = mapped_column(Text, nullable=False, default="")
     active: Mapped[bool] = mapped_column(nullable=False, default=True)
 
 
@@ -91,6 +92,7 @@ class RoundRow(Base):
     dp_applied: Mapped[bool] = mapped_column(nullable=False)
     epsilon_used: Mapped[float] = mapped_column(nullable=False)
     dp_sigma: Mapped[float] = mapped_column(nullable=False)
+    delta_used: Mapped[float] = mapped_column(nullable=False, default=1e-5)
 
 
 class AuditRow(Base):

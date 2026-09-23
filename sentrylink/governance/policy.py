@@ -7,7 +7,35 @@ from dataclasses import dataclass, field
 
 from ..config import MAX_ORG_CONTRIB, MIN_PARTICIPANTS
 from ..crypto.differential_privacy import PrivacyBudget
+from ..errors import (
+    ConsentDeniedError,
+    DomainMismatchError,
+    EpsilonTooHighError,
+    GovernanceError,
+    HealthcareCohortTooSmallError,
+    HealthcareEpsilonTooHighError,
+    CohortTooSmallError,
+    InvalidDataError,
+    QueryNotAllowedError,
+    ScopeMismatchError,
+)
 from .registry import Organization, Registry
+
+_CODE_TO_ERROR = {
+    "QUERY_NOT_ALLOWED": QueryNotAllowedError,
+    "COHORT_TOO_SMALL": CohortTooSmallError,
+    "HEALTHCARE_COHORT_TOO_SMALL": HealthcareCohortTooSmallError,
+    "EPSILON_TOO_HIGH": EpsilonTooHighError,
+    "HEALTHCARE_EPSILON_TOO_HIGH": HealthcareEpsilonTooHighError,
+    "CONSENT_REQUIRED": ConsentDeniedError,
+    "SECTOR_MISMATCH": ScopeMismatchError,
+    "DOMAIN_MISMATCH": DomainMismatchError,
+    "INVALID_DATA": InvalidDataError,
+}
+
+
+def _error_for_code(code: str | None):
+    return _CODE_TO_ERROR.get(code or "", GovernanceError)
 
 ALLOWED_METRICS = {
     "histogram",
@@ -54,10 +82,12 @@ class QueryDecision:
     participants: list[str]
     reasons: list[str]
     budget: PrivacyBudget
+    code: str | None = None
+    policy_snapshot: dict = field(default_factory=dict)
 
     def raise_if_denied(self):
         if not self.allowed:
-            raise PermissionError("; ".join(self.reasons))
+            raise _error_for_code(self.code)("; ".join(self.reasons))
 
 
 class PolicyEngine:
@@ -71,19 +101,79 @@ class PolicyEngine:
 
     def evaluate(self, req: QueryRequest) -> QueryDecision:
         reasons: list[str] = []
+        code: str | None = None
         candidates = self.registry.cohort(req.sector_group, req.domain)
         participants: list[str] = []
 
-        if req.metric not in ALLOWED_METRICS:
-            reasons.append(f"metric '{req.metric}' not in platform allow-list")
+        def snapshot(floor: int) -> dict:
+            caps = [
+                self.policies.get(oid, ConsentPolicy.default()).max_epsilon_per_query
+                for oid in participants
+            ]
+            return {
+                "metric": req.metric,
+                "floor_required": floor,
+                "candidates": len(candidates),
+                "epsilon_cap_min": min(caps) if caps else None,
+            }
 
+        def denied(reason: str, reason_code: str, floor: int = MIN_PARTICIPANTS) -> QueryDecision:
+            reasons.append(reason)
+            return QueryDecision(
+                allowed=False,
+                query_id=secrets.token_hex(8),
+                participants=[],
+                reasons=reasons,
+                budget=req.budget,
+                code=reason_code,
+                policy_snapshot=snapshot(floor),
+            )
+
+        if req.metric not in ALLOWED_METRICS:
+            return denied(
+                f"metric '{req.metric}' not in platform allow-list", "QUERY_NOT_ALLOWED"
+            )
+        if req.epsilon <= 0:
+            return denied("epsilon must be positive", "INVALID_DATA")
+        if req.delta <= 0 or req.delta >= 1:
+            return denied("delta must be in (0, 1)", "INVALID_DATA")
+
+        if not candidates:
+            if not self.registry.cohort(req.sector_group):
+                return denied(
+                    f"unknown sector_group '{req.sector_group}'", "SECTOR_MISMATCH"
+                )
+            return denied(
+                f"no organizations for domain '{req.domain}' "
+                f"in sector_group '{req.sector_group}'",
+                "DOMAIN_MISMATCH",
+            )
+
+        epsilon_blocked = 0
         for org in candidates:
             pol = self.policies.get(org.org_id, ConsentPolicy.default())
             if req.metric not in pol.allowed_metrics:
                 continue
             if req.epsilon > pol.max_epsilon_per_query:
+                epsilon_blocked += 1
                 continue
             participants.append(org.org_id)
+
+        if not participants and epsilon_blocked == len(candidates):
+            variant = (
+                "HEALTHCARE_EPSILON_TOO_HIGH"
+                if req.domain == "healthcare"
+                else "EPSILON_TOO_HIGH"
+            )
+            return denied(
+                f"epsilon {req.epsilon} exceeds every consented per-query cap",
+                variant,
+            )
+        if not participants:
+            return denied(
+                "no organization consented to this metric at this budget",
+                "CONSENT_REQUIRED",
+            )
 
         # Cohort floor: global minimum, raised to the strictest
         # min_participants among contributing orgs (e.g. healthcare k>=4).
@@ -92,21 +182,26 @@ class PolicyEngine:
             pol = self.policies.get(oid, ConsentPolicy.default())
             required = max(required, pol.min_participants)
         if len(participants) < required:
-            reasons.append(
-                f"cohort too small: {len(participants)} consented "
-                f"< min_participants={required}"
+            variant = (
+                "HEALTHCARE_COHORT_TOO_SMALL"
+                if req.domain == "healthcare" and required >= 4
+                else "COHORT_TOO_SMALL"
             )
-        if req.epsilon <= 0:
-            reasons.append("epsilon must be positive")
-        if req.delta <= 0 or req.delta >= 1:
-            reasons.append("delta must be in (0, 1)")
+            return denied(
+                f"cohort too small: {len(participants)} consented "
+                f"< min_participants={required}",
+                variant,
+                floor=required,
+            )
 
         return QueryDecision(
-            allowed=not reasons,
+            allowed=True,
             query_id=secrets.token_hex(8),
             participants=sorted(participants),
             reasons=reasons,
             budget=req.budget,
+            code=None,
+            policy_snapshot=snapshot(required),
         )
 
     @staticmethod

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..config import ROUNDS_DEFAULT_LR
+from ..errors import InvalidDataError, ModelDimensionMismatchError
 from .model import LogisticModel, evaluate_sufficient_stats, sigmoid
 
 
@@ -22,9 +23,19 @@ class FederatedClient:
         self.x = np.asarray(self.x, dtype=np.float64)
         self.y = np.asarray(self.y, dtype=np.float64).reshape(-1)
         if len(self.x) != len(self.y):
-            raise ValueError("x/y length mismatch")
+            raise InvalidDataError("x/y length mismatch")
         if len(self.x) == 0:
-            raise ValueError("client has no data")
+            raise InvalidDataError("client has no data")
+        if self.x.ndim != 2:
+            raise InvalidDataError("x must be a 2-D feature matrix")
+        if not np.all(np.isfinite(self.x)) or not np.all(np.isfinite(self.y)):
+            raise InvalidDataError("features and labels must be finite (no NaN/inf)")
+        if not set(np.unique(self.y)) <= {0.0, 1.0}:
+            raise InvalidDataError("labels must be binary (0/1)")
+        if not np.isfinite(self.lr) or self.lr <= 0:
+            raise InvalidDataError("learning rate must be positive and finite")
+        if not np.isfinite(self.l2) or self.l2 < 0:
+            raise InvalidDataError("l2 must be non-negative and finite")
         self.dim = self.x.shape[1]
 
     @property
@@ -34,7 +45,11 @@ class FederatedClient:
     def local_train(self, global_model: LogisticModel, epochs: int = 2) -> np.ndarray:
         """SGD on private data; returns delta = local - global (flat vector)."""
         if global_model.dim != self.dim:
-            raise ValueError("model dim mismatch")
+            raise ModelDimensionMismatchError(
+                f"model dim {global_model.dim} != client dim {self.dim}"
+            )
+        if epochs < 1:
+            raise InvalidDataError("epochs must be >= 1")
         w = global_model.flat.copy()
         n = len(self.x)
         rng = np.random.default_rng(abs(hash(self.org_id)) % (2**32))
@@ -59,6 +74,8 @@ class FederatedClient:
         in the clear — only their masked sum is ever opened.
         """
         if global_model.dim != self.dim:
-            raise ValueError("model dim mismatch")
+            raise ModelDimensionMismatchError(
+                f"model dim {global_model.dim} != client dim {self.dim}"
+            )
         n, loss_sum, correct = evaluate_sufficient_stats(global_model, self.x, self.y)
         return np.array([float(n), float(loss_sum), float(correct)], dtype=np.float64)

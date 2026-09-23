@@ -36,8 +36,8 @@ def _sqlite(tmp_path):
 def test_schema_version_and_idempotent_migrate(tmp_path):
     store = _sqlite(tmp_path)
     try:
-        assert get_schema_version(store.engine) == CURRENT_SCHEMA_VERSION == 1
-        assert migrate(store.engine) == 1  # re-run is a no-op
+        assert get_schema_version(store.engine) == CURRENT_SCHEMA_VERSION == 2
+        assert migrate(store.engine) == 2  # re-run is a no-op
         tables = set(inspect(store.engine).get_table_names())
         assert {
             "schema_meta", "orgs", "policies", "privacy_budget",
@@ -53,7 +53,43 @@ def test_migrate_from_empty_engine(tmp_path):
     engine = create_engine_for(normalize_url(str(tmp_path / "bare.db")))
     try:
         assert get_schema_version(engine) == 0
-        assert migrate(engine) == 1
+        assert migrate(engine) == 2
+    finally:
+        engine.dispose()
+
+
+def test_migrate_v1_to_v2_preserves_data(tmp_path):
+    """Simulate a v1 database, upgrade, and prove data + defaults survive."""
+    from sqlalchemy import text
+
+    from sentrylink.storage.engine import normalize_url
+
+    engine = create_engine_for(normalize_url(str(tmp_path / "v1.db")))
+    try:
+        from sentrylink.storage.models import Base
+
+        Base.metadata.create_all(engine)
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE orgs DROP COLUMN key_salt"))
+            conn.execute(text("ALTER TABLE federated_rounds DROP COLUMN delta_used"))
+            conn.execute(text("DELETE FROM schema_meta"))
+            conn.execute(text("INSERT INTO schema_meta (id, version) VALUES (1, 1)"))
+            conn.execute(
+                text(
+                    "INSERT INTO orgs (org_id, name, domain, sector_group, "
+                    "api_key_hash, key_algo, active) VALUES "
+                    "('o1', 'Acme', 'retail', 'g', 'h', 'pbkdf2-sha256', 1)"
+                )
+            )
+        assert get_schema_version(engine) == 1
+        assert migrate(engine) == 2
+        # data intact, new columns present with safe defaults
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT org_id, key_salt FROM orgs WHERE org_id = 'o1'")
+            ).first()
+            assert row[0] == "o1" and row[1] == ""
+            assert migrate(engine) == 2  # restart-safe re-run
     finally:
         engine.dispose()
 
@@ -89,11 +125,14 @@ def test_api_key_hash_and_verify():
     restored = Organization(
         org_id=org.org_id, name=org.name, domain=org.domain,
         sector_group=org.sector_group, api_key="", api_key_hash=org.api_key_hash,
+        key_salt=org.key_salt,
     )
     assert restored.api_key == ""
     assert restored.verify_key(org.api_key)
     assert not restored.verify_key("wrong")
-    assert hash_api_key("k", "o1") == hash_api_key("k", "o1")  # deterministic salt
+    assert hash_api_key("k", salt="s1") == hash_api_key("k", salt="s1")  # deterministic
+    assert hash_api_key("k", salt="s1") != hash_api_key("k", salt="s2")  # salt matters
+    assert org.key_salt and len(org.key_salt) >= 32  # random per-org salt
 
 
 def test_budget_snapshot_roundtrip_with_float_rdp_keys():
@@ -196,14 +235,14 @@ def test_concurrent_store_writes_serialized(tmp_path):
 
 EXPECTED_COLUMNS = {
     "schema_meta": {"id", "version"},
-    "orgs": {"org_id", "name", "domain", "sector_group", "api_key_hash", "key_algo", "active"},
+    "orgs": {"org_id", "name", "domain", "sector_group", "api_key_hash", "key_algo", "key_salt", "active"},
     "policies": {"org_id", "allowed_metrics", "min_participants", "max_epsilon_per_query", "purpose"},
     "privacy_budget": {"id", "limit_epsilon", "limit_delta", "spent_epsilon", "spent_delta",
                        "rdp_totals", "rdp_complete", "events"},
     "federated_servers": {"key", "dim", "bias", "weights", "rounds"},
     "federated_rounds": {"id", "server_key", "round_id", "participants", "dropped",
                          "aggregate_delta", "weights", "eval_stats", "dp_applied",
-                         "epsilon_used", "dp_sigma"},
+                         "epsilon_used", "dp_sigma", "delta_used"},
     "audit_log": {"seq", "entry"},
 }
 

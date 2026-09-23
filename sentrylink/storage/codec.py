@@ -17,6 +17,7 @@ from typing import Any
 
 import numpy as np
 
+from ..config import DEFAULT_DELTA
 from ..crypto.differential_privacy import PrivacyAccountant, PrivacyBudget
 from ..federated.model import LogisticModel
 from ..federated.server import FederatedServer, RoundResult
@@ -39,11 +40,15 @@ def decode_vector(blob: bytes, dim: int) -> np.ndarray:
 
 def encode_org(org: Organization) -> dict[str, Any]:
     key_hash = org.api_key_hash
+    salt = org.key_salt
     algo = ""
-    if not key_hash and org.api_key:
-        key_hash = hash_api_key(org.api_key, org.org_id)
+    if key_hash:
         algo = "pbkdf2-sha256"
-    elif key_hash:
+    elif org.api_key:
+        # Defensive path (register() always sets both): hash with the
+        # per-org salt, falling back to the legacy org_id salt.
+        salt = salt or org.org_id
+        key_hash = hash_api_key(org.api_key, salt=salt)
         algo = "pbkdf2-sha256"
     return {
         "org_id": org.org_id,
@@ -52,6 +57,7 @@ def encode_org(org: Organization) -> dict[str, Any]:
         "sector_group": org.sector_group,
         "api_key_hash": key_hash,
         "key_algo": algo,
+        "key_salt": salt,
         "active": org.active,
     }
 
@@ -65,6 +71,7 @@ def decode_org(data: dict[str, Any]) -> Organization:
         api_key="",
         active=bool(data.get("active", True)),
         api_key_hash=data.get("api_key_hash", ""),
+        key_salt=data.get("key_salt", ""),
     )
 
 
@@ -132,6 +139,7 @@ def encode_round(server_key: str, result: RoundResult) -> dict[str, Any]:
         "dp_applied": result.dp_applied,
         "epsilon_used": result.epsilon_used,
         "dp_sigma": result.dp_sigma,
+        "delta_used": result.delta_used,
     }
 
 
@@ -158,6 +166,7 @@ def decode_round(data: dict[str, Any], dim: int) -> RoundResult:
         dp_applied=bool(data["dp_applied"]),
         epsilon_used=float(data["epsilon_used"]),
         dp_sigma=float(data.get("dp_sigma", 0.0)),
+        delta_used=float(data.get("delta_used", DEFAULT_DELTA)),
     )
 
 

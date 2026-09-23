@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from ..errors import PrivacyBudgetError
+
 
 def gaussian_sigma(sensitivity: float, epsilon: float, delta: float) -> float:
     """Classic analytic calibration: sigma >= sens * sqrt(2 ln(1.25/delta)) / eps."""
@@ -143,6 +145,31 @@ class PrivacyAccountant:
     rdp_totals: dict[float, float] = field(default_factory=dict)
     rdp_complete: bool = True
 
+    def preview(
+        self, cost: PrivacyBudget, rdp: dict[float, float] | None = None
+    ) -> tuple[bool, str]:
+        """Non-mutating admission check: (allowed, accounting_regime).
+
+        Mirrors charge() exactly but records nothing — used by privacy
+        previews. Regime is "rdp" when RDP-tracked, else "basic".
+        """
+        if cost.epsilon < 0 or cost.delta < 0:
+            raise ValueError("cost must be non-negative")
+        projected = self.spent + cost
+        if projected.delta > self.limit.delta + 1e-12:
+            return False, "basic"
+        if rdp is not None and self.rdp_complete:
+            keys = set(self.rdp_totals) | set(rdp)
+            proj_rdp = {
+                a: self.rdp_totals.get(a, 0.0) + rdp.get(a, 0.0) for a in keys
+            }
+            rdp_eps = rdp_to_epsilon(proj_rdp, self.limit.delta)
+            basic_fits = projected.epsilon <= self.limit.epsilon + 1e-12
+            if rdp_eps <= self.limit.epsilon + 1e-12 or basic_fits:
+                return True, "rdp"
+            return False, "rdp"
+        return projected.epsilon <= self.limit.epsilon + 1e-12, "basic"
+
     def charge(
         self,
         cost: PrivacyBudget,
@@ -150,12 +177,14 @@ class PrivacyAccountant:
         subject: str,
         *,
         rdp: dict[float, float] | None = None,
+        ledger: dict | None = None,
     ) -> dict:
         if cost.epsilon < 0 or cost.delta < 0:
             raise ValueError("cost must be non-negative")
         projected = self.spent + cost
+        before = {"epsilon": self.spent.epsilon, "delta": self.spent.delta}
         if projected.delta > self.limit.delta + 1e-12:
-            raise PermissionError(
+            raise PrivacyBudgetError(
                 f"delta budget exceeded for {subject}: "
                 f"{projected.delta:.6g} > {self.limit.delta:.6g}"
             )
@@ -167,7 +196,7 @@ class PrivacyAccountant:
             rdp_eps = rdp_to_epsilon(proj_rdp, self.limit.delta)
             basic_fits = projected.epsilon <= self.limit.epsilon + 1e-12
             if rdp_eps > self.limit.epsilon + 1e-12 and not basic_fits:
-                raise PermissionError(
+                raise PrivacyBudgetError(
                     f"epsilon budget exceeded for {subject}: "
                     f"basic {projected.epsilon:.4f} and RDP {rdp_eps:.4f} "
                     f"both exceed {self.limit.epsilon:.4f}"
@@ -175,7 +204,7 @@ class PrivacyAccountant:
             self.rdp_totals = proj_rdp
         else:
             if projected.epsilon > self.limit.epsilon + 1e-12:
-                raise PermissionError(
+                raise PrivacyBudgetError(
                     f"epsilon budget exceeded for {subject}: "
                     f"{projected.epsilon:.4f} > {self.limit.epsilon:.4f}"
                 )
@@ -195,6 +224,9 @@ class PrivacyAccountant:
             "spent_epsilon": self.spent.epsilon,
             "spent_delta": self.spent.delta,
             "rdp_tracked": rdp is not None,
+            "ledger": dict(ledger or {}),
+            "budget_before": before,
+            "budget_after": {"epsilon": self.spent.epsilon, "delta": self.spent.delta},
         }
         self.events.append(record)
         return record

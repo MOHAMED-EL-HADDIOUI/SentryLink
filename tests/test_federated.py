@@ -58,6 +58,42 @@ def test_dp_noise_actually_perturbs_aggregate():
     assert not np.allclose(r1.aggregate_delta, r2.aggregate_delta)
 
 
+def test_client_rejects_nonfinite_and_nonbinary_data():
+    import pytest as _pt
+
+    from sentrylink.errors import InvalidDataError, ModelDimensionMismatchError
+
+    x = np.random.default_rng(0).normal(size=(10, 4))
+    y = np.zeros(10)
+    with _pt.raises(InvalidDataError):
+        FederatedClient(org_id="a", x=np.full((10, 4), np.nan), y=y)
+    with _pt.raises(InvalidDataError):
+        FederatedClient(org_id="a", x=np.full((10, 4), np.inf), y=y)
+    with _pt.raises(InvalidDataError):
+        FederatedClient(org_id="a", x=x, y=np.full(10, 0.5))
+    with _pt.raises(InvalidDataError):
+        FederatedClient(org_id="a", x=x, y=y, lr=0.0)
+    with _pt.raises(InvalidDataError):
+        FederatedClient(org_id="a", x=x, y=y, l2=-1.0)
+    c = FederatedClient(org_id="a", x=x, y=y)
+    with _pt.raises(ModelDimensionMismatchError):
+        c.local_train(LogisticModel.zeros(3))
+    with _pt.raises(InvalidDataError):
+        c.local_train(LogisticModel.zeros(4), epochs=0)
+
+
+def test_duplicate_roster_rejected():
+    import pytest as _pt
+
+    from sentrylink.errors import DuplicateRosterError
+
+    orgs = make_retail_cohort(n_orgs=2, n_per_org=50, seed=7)
+    clients = _clients(orgs, [o.org_id for o in orgs])
+    server = FederatedServer(dim=4)
+    with _pt.raises(DuplicateRosterError):
+        server.run_round(clients + clients[:1], epochs=1, apply_dp=False)
+
+
 def test_eval_stats_are_pooled_not_per_client():
     orgs = make_retail_cohort(n_orgs=3, n_per_org=100, seed=2)
     clients = _clients(orgs, [o.org_id for o in orgs])

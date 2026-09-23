@@ -16,10 +16,10 @@ KEY_HASH_ALGO = "pbkdf2-sha256"
 KEY_HASH_ITERATIONS = 100_000
 
 
-def hash_api_key(api_key: str, org_id: str) -> str:
-    """Salted API-key hash (salt = org_id). Stored; plaintext never is."""
+def hash_api_key(api_key: str, *, salt: str) -> str:
+    """Salted API-key hash. Stored; plaintext never is."""
     digest = hashlib.pbkdf2_hmac(
-        "sha256", api_key.encode(), org_id.encode(), KEY_HASH_ITERATIONS
+        "sha256", api_key.encode(), salt.encode(), KEY_HASH_ITERATIONS
     ).hex()
     return f"{KEY_HASH_ALGO}${KEY_HASH_ITERATIONS}${digest}"
 
@@ -33,6 +33,7 @@ class Organization:
     api_key: str = field(default_factory=lambda: secrets.token_urlsafe(24))
     active: bool = True
     api_key_hash: str = ""
+    key_salt: str = ""
 
     def public(self) -> dict:
         return {
@@ -47,9 +48,11 @@ class Organization:
         # Same-process path: plaintext key still resident in memory.
         if self.api_key and hmac.compare_digest(api_key, self.api_key):
             return True
-        # Restored path: only the salted hash survived the restart.
+        # Restored path: only the salted hash survived the restart. Rows
+        # written before per-org salts fall back to the legacy org_id salt.
         if self.api_key_hash and hmac.compare_digest(
-            hash_api_key(api_key, self.org_id), self.api_key_hash
+            hash_api_key(api_key, salt=self.key_salt or self.org_id),
+            self.api_key_hash,
         ):
             return True
         return False
@@ -70,7 +73,8 @@ class Registry:
         if org_id in self._orgs:
             raise ValueError(f"org {org_id} already registered")
         org = Organization(org_id=org_id, name=name, domain=domain, sector_group=sector_group)
-        org.api_key_hash = hash_api_key(org.api_key, org.org_id)
+        org.key_salt = secrets.token_hex(16)
+        org.api_key_hash = hash_api_key(org.api_key, salt=org.key_salt)
         self._orgs[org.org_id] = org
         return org
 

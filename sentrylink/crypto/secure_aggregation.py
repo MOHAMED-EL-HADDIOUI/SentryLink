@@ -34,6 +34,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from ..config import QUANT_SCALE, UPDATE_CLIP
+from ..errors import InvalidDataError, ProtocolError
 from .prg import int_masks
 
 
@@ -103,13 +104,15 @@ class SecAggClient:
         that must not be rescaled.
         """
         if set(peer_keys) != set(self.roster):
-            raise RuntimeError("waiting for all roster keys before masking")
+            raise ProtocolError("waiting for all roster keys before masking")
         v = np.asarray(update, dtype=np.float64)
+        if not np.all(np.isfinite(v)):
+            raise InvalidDataError("update must be finite (no NaN/inf)")
         if clip_bound is not None:
             v = clip_l2(v, clip_bound)
         q = quantize(v)
         if q.shape != (self.dim,):
-            raise ValueError(f"update dim {q.shape} != ({self.dim},)")
+            raise InvalidDataError(f"update dim {q.shape} != ({self.dim},)")
 
         mask = np.zeros(self.dim, dtype=np.int64)
         for peer in self.roster:
@@ -180,7 +183,7 @@ class SecAggServer:
     def finalize(self) -> np.ndarray:
         """Return the summed (dequantized) aggregate from received contributions."""
         if not self._contributions:
-            raise RuntimeError("no contributions")
+            raise ProtocolError("no contributions")
         received = set(self._contributions)
         dropped = [oid for oid in self.roster if oid not in received]
 
@@ -191,7 +194,7 @@ class SecAggServer:
                 key = (first, second)
                 seed = self._revealed_seeds.get(key)
                 if seed is None:
-                    raise RuntimeError(
+                    raise ProtocolError(
                         f"missing recovery seed for pair {key}; cannot unmask dropout"
                     )
                 stream = int_masks(seed, self.dim)

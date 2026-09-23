@@ -13,15 +13,38 @@ from sqlalchemy.engine import Engine
 
 from .models import Base, SchemaMeta
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 def _migrate_to_1(engine: Engine) -> None:
     Base.metadata.create_all(engine, checkfirst=True)
 
 
+def _migrate_to_2(engine: Engine) -> None:
+    """Random per-org key salts + persisted round delta.
+
+    Idempotent: only adds columns that are missing, so fresh databases
+    (whose create_all already includes them) and restarts are safe.
+    """
+    org_cols = {c["name"] for c in inspect(engine).get_columns("orgs")}
+    round_cols = {c["name"] for c in inspect(engine).get_columns("federated_rounds")}
+    with engine.begin() as conn:
+        if "key_salt" not in org_cols:
+            conn.execute(
+                text("ALTER TABLE orgs ADD COLUMN key_salt TEXT NOT NULL DEFAULT ''")
+            )
+        if "delta_used" not in round_cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE federated_rounds ADD COLUMN "
+                    "delta_used REAL NOT NULL DEFAULT 0.00001"
+                )
+            )
+
+
 MIGRATIONS = {
     1: _migrate_to_1,
+    2: _migrate_to_2,
 }
 
 
