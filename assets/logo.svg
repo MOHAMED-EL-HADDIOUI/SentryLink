@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6D28D9"/>
+      <stop offset="0.55" stop-color="#4F46E5"/>
+      <stop offset="1" stop-color="#06B6D4"/>
+    </linearGradient>
+    <linearGradient id="link" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#A5B4FC"/>
+      <stop offset="1" stop-color="#67E8F9"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)"/>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="none" stroke="#FFFFFF" stroke-opacity="0.25" stroke-width="3"/>
+  <!-- network: three org nodes linked through a central lock -->
+  <g filter="url(#glow)">
+    <line x1="78" y1="92" x2="128" y2="128" stroke="url(#link)" stroke-width="7" stroke-linecap="round"/>
+    <line x1="178" y1="92" x2="128" y2="128" stroke="url(#link)" stroke-width="7" stroke-linecap="round"/>
+    <line x1="128" y1="176" x2="128" y2="128" stroke="url(#link)" stroke-width="7" stroke-linecap="round"/>
+    <circle cx="78" cy="92" r="17" fill="#0F172A" stroke="#E0E7FF" stroke-width="4"/>
+    <circle cx="178" cy="92" r="17" fill="#0F172A" stroke="#E0E7FF" stroke-width="4"/>
+    <circle cx="128" cy="176" r="17" fill="#0F172A" stroke="#E0E7FF" stroke-width="4"/>
+    <circle cx="78" cy="92" r="5" fill="#67E8F9"/>
+    <circle cx="178" cy="92" r="5" fill="#67E8F9"/>
+    <circle cx="128" cy="176" r="5" fill="#67E8F9"/>
+  </g>
+  <!-- central shield = protected aggregate -->
+  <g>
+    <path d="M128 102 L152 112 V132 C152 148 141 159 128 165 C115 159 104 148 104 132 V112 Z"
+          fill="#0F172A" stroke="#FFFFFF" stroke-width="5" stroke-linejoin="round"/>
+    <path d="M120 132 l6 6 l12 -13" fill="none" stroke="#34D399" stroke-width="6"
+          stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>
