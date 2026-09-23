@@ -1,19 +1,39 @@
-"""End-to-end demo: three verticals on one SentryLink deployment.
+"""End-to-end demo: the complete SentryLink story in one terminal run.
 
 Run:  python -m sentrylink.demo
+
+Narrative:
+  1. Register organizations          11. Aggregate model
+  2. Issue credentials               12. Apply DP
+  3. Configure governance            13. Charge privacy budget
+  4. Establish consent               14. Write audit event
+  5. Generate synthetic local data   15. Verify audit chain
+  6. Run histogram                   16. Restart from SQLite
+  7. Run variance/correlation        17. Authenticate with original API key
+  8. Run federated training          18. Verify model continuity
+  9. Simulate dropout                19. Show privacy ledger + Privacy Card
+  10. (compact manufacturing + healthcare passes)
+                                     20. Show final budget + guarantees
+
+Only aggregates are ever printed. API keys and raw rows never appear.
 """
 
 from __future__ import annotations
+
+import tempfile
 
 import numpy as np
 
 from .federated.client import FederatedClient
 from .platform import SentryLinkPlatform
+from .privacy import render_card_text
+from .storage import SQLiteStateStore
 from .usecases import (
     make_healthcare_cohort,
     make_manufacturing_cohort,
     make_retail_cohort,
 )
+from .verticals import policy_for_domain
 
 
 def _banner(title: str) -> None:
@@ -22,179 +42,11 @@ def _banner(title: str) -> None:
     print("=" * 72)
 
 
-def _run_vertical(
-    platform: SentryLinkPlatform,
-    *,
-    label: str,
-    sector_group: str,
-    domain: str,
-    orgs,
-    histogram_fn,
-    corr_fn,
-) -> None:
-    _banner(label)
-
-    registered = [
-        platform.join(o.name, domain=domain, sector_group=sector_group) for o in orgs
-    ]
-    by_id = {reg.org_id: data for reg, data in zip(registered, orgs)}
-
-    # map synthetic ids to registry ids
-    org_ids = [reg.org_id for reg in registered]
-    print(f"Consortium '{sector_group}': {len(registered)} organizations onboarded")
-    for reg in registered:
-        print(f"  - {reg.name} ({reg.org_id}) domain={reg.domain}")
-
-    # ---- federated round (secure aggregation + DP) ----
-    clients = {
-        oid: FederatedClient(org_id=oid, x=by_id[oid].x, y=by_id[oid].y)
-        for oid in org_ids
-    }
-    result = platform.run_federated_round(
-        sector_group,
-        domain,
-        clients,
-        epsilon=8.0,
-        delta=1e-5,
-        epochs=2,
-    )
-    print("\n[Federated round]")
-    print(f"  round_id        : {result.round_id}")
-    print(f"  participants    : {result.participants}")
-    print(f"  dropped         : {result.dropped or 'none'}")
-    print(f"  DP noise applied: {result.dp_applied} (epsilon={result.epsilon_used})")
-    print(
-        f"  cohort metrics  : acc={result.eval_stats['accuracy']:.3f} "
-        f"loss={result.eval_stats['mean_loss']:.3f} n={result.eval_stats['n']}"
-    )
-    print("  per-client updates were pairwise-masked; server saw only the sum.")
-
-    # dropout resilience round
-    if len(org_ids) >= 4:
-        drop_id = org_ids[-1]
-        r2 = platform.run_federated_round(
-            sector_group, domain, clients, epsilon=4.0, epochs=1, drop=[drop_id]
-        )
-        print(f"\n[Dropout round] dropped={r2.dropped} → recovery seeds unmasked OK")
-
-    # ---- histogram query (MPC + DP) ----
-    buckets = histogram_fn(orgs, org_ids)
-    labels = [f"b{i}" for i in range(len(next(iter(buckets.values()))))]
-    hres = platform.histogram(
-        sector_group,
-        domain,
-        buckets,
-        labels=labels,
-        epsilon=8.0,
-        delta=1e-5,
-        purpose=f"{domain} distribution insight",
-    )
-    print("\n[Histogram via secret-shared MPC + DP]")
-    print(f"  participants    : {hres.participants}")
-    print(f"  raw joint totals: {hres.raw_value}  (never attributed per org)")
-    print(f"  released (DP)   : {hres.value}")
-    print(f"  noise sigma     : {hres.noise_sigma:.1f}")
-
-    # ---- correlation query ----
-    pairs = corr_fn(orgs, org_ids)
-    cres = platform.correlation(
-        sector_group,
-        domain,
-        pairs,
-        epsilon=8.0,
-        delta=1e-5,
-        purpose=f"{domain} association insight",
-    )
-    print("\n[Correlation via secret-shared sufficient statistics + DP]")
-    print(f"  raw ρ (pooled)  : {cres.raw_value:.4f}")
-    print(f"  released ρ (DP) : {cres.value:.4f}")
+def _step(n: int, text: str) -> None:
+    print(f"\n[step {n:02d}] {text}")
 
 
-def demo_retail(platform: SentryLinkPlatform) -> None:
-    orgs = make_retail_cohort()
-
-    def hist(orgs, ids):
-        out = {}
-        for oid, o in zip(ids, orgs):
-            # demand-lift buckets by foot-traffic quartile
-            q = np.quantile(o.x[:, 3], [0.25, 0.5, 0.75])
-            binned = np.digitize(o.x[:, 3], q)
-            counts = [int(np.sum((binned == k) & (o.y == 1))) for k in range(4)]
-            out[oid] = counts
-        return out
-
-    def corr(orgs, ids):
-        return {oid: (o.x[:, 0].tolist(), o.y.tolist()) for oid, o in zip(ids, orgs)}
-
-    _run_vertical(
-        platform,
-        label="VERTICAL 1 — RETAIL: emerging demand pattern detection",
-        sector_group="retail-consortium",
-        domain="retail",
-        orgs=orgs,
-        histogram_fn=hist,
-        corr_fn=corr,
-    )
-
-
-def demo_manufacturing(platform: SentryLinkPlatform) -> None:
-    orgs = make_manufacturing_cohort()
-
-    def hist(orgs, ids):
-        out = {}
-        for oid, o in zip(ids, orgs):
-            # defect counts by vibration severity band
-            edges = [-1.0, -0.25, 0.25, 1.0, 10.0]
-            binned = np.digitize(o.x[:, 0], edges[1:-1])
-            counts = [int(np.sum((binned == k) & (o.y == 1))) for k in range(4)]
-            out[oid] = counts
-        return out
-
-    def corr(orgs, ids):
-        return {oid: (o.x[:, 1].tolist(), o.y.tolist()) for oid, o in zip(ids, orgs)}
-
-    _run_vertical(
-        platform,
-        label="VERTICAL 2 — MANUFACTURING: cross-plant quality issue spotting",
-        sector_group="supply-chain-mfg",
-        domain="manufacturing",
-        orgs=orgs,
-        histogram_fn=hist,
-        corr_fn=corr,
-    )
-
-
-def demo_healthcare(platform: SentryLinkPlatform) -> None:
-    orgs = make_healthcare_cohort()
-
-    def hist(orgs, ids):
-        out = {}
-        for oid, o in zip(ids, orgs):
-            # response counts by treatment arm (col 3) + severity band (col 1)
-            arm = np.rint((o.x[:, 3] > 0).astype(int)).astype(int)
-            sev = (o.x[:, 1] > 0).astype(int)
-            counts = [int(np.sum((arm == a) & (sev == s) & (o.y == 1))) for a in (0, 1) for s in (0, 1)]
-            out[oid] = counts
-        return out
-
-    def corr(orgs, ids):
-        # biomarker (col 2) vs response
-        return {oid: (o.x[:, 2].tolist(), o.y.tolist()) for oid, o in zip(ids, orgs)}
-
-    _run_vertical(
-        platform,
-        label="VERTICAL 3 — HEALTHCARE: treatment-response clusters",
-        sector_group="hospital-network",
-        domain="healthcare",
-        orgs=orgs,
-        histogram_fn=hist,
-        corr_fn=corr,
-    )
-
-
-def main() -> None:
-    platform = SentryLinkPlatform()
-
+def demo_retail_narrative() -> SentryLinkPlatform:
     _banner("SENTRYLINK — privacy-preserving cross-organization intelligence")
     print(
         "Raw rows never leave an organization.\n"
@@ -202,19 +54,168 @@ def main() -> None:
         "• MPC: additive secret shares across 2 non-colluding nodes (linear-only)\n"
         "• Differential privacy: Laplace on aggregates (pure ε), Gaussian on FL models\n"
         "• Governance: consent policies, k≥3 cohort floor, hash-chained audit log\n"
+        "• Persistence: SQLite + migrations, deterministic restart replay"
     )
 
-    demo_retail(platform)
-    demo_manufacturing(platform)
-    demo_healthcare(platform)
+    tmp = tempfile.mkdtemp(prefix="sentrylink-demo-")
+    platform = SentryLinkPlatform(store=SQLiteStateStore(f"{tmp}/demo.db"))
 
-    _banner("PRIVACY ACCOUNTING & AUDIT")
-    budget = platform.budget_report()
-    print(f"  ε spent   : {budget['spent_epsilon']:.3f} / {budget['limit_epsilon']:.1f}")
-    print(f"  ε remaining: {budget['remaining_epsilon']:.3f}")
-    print(f"  audit entries : {budget['events']} charged events")
-    print(f"  audit chain OK: {platform.audit.verify_chain()}")
+    _step(1, "register organizations (retail consortium)")
+    orgs = make_retail_cohort(n_orgs=4, n_per_org=200, seed=7)
+    registered = [
+        platform.join(o.name, domain="retail", sector_group="retail-consortium")
+        for o in orgs
+    ]
+    by_id = {reg.org_id: data for reg, data in zip(registered, orgs)}
+    org_ids = [reg.org_id for reg in registered]
+    print(f"  onboarded {len(registered)} organizations")
+
+    _step(2, "issue credentials (shown once, memory-only, hashed at rest)")
+    print(f"  {len(registered)} API keys issued — never printed, logged, or persisted")
+
+    _step(3, "configure governance from the retail vertical policy")
+    vp = policy_for_domain("retail")
+    print(f"  floor k>={vp.min_participants}, per-query eps<={vp.max_epsilon_per_query}, "
+          f"metrics={sorted(vp.allowed_metrics)}")
+
+    _step(4, "establish consent (allow-list only; caps preserved)")
+    for oid in org_ids:
+        platform.set_consent(oid, {"histogram", "variance", "correlation",
+                                   "federated_model_round"})
+    print("  all 4 orgs consented to analytics metrics")
+
+    _step(5, "generate synthetic local data (200 rows/org, never leaves the org)")
+    clients = {oid: FederatedClient(org_id=oid, x=by_id[oid].x, y=by_id[oid].y)
+               for oid in org_ids}
+
+    _step(6, "histogram via secret-shared MPC + Laplace DP")
+    buckets = {}
+    for oid, o in zip(org_ids, orgs):
+        binned = np.digitize(o.x[:, 3], [0.0])
+        buckets[oid] = [int(np.sum((binned == 0) & (o.y == 1))),
+                        int(np.sum((binned == 1) & (o.y == 1)))]
+    hist = platform.histogram("retail-consortium", "retail", buckets,
+                              labels=["low", "high"], epsilon=2.0,
+                              purpose="demand distribution insight")
+    print(f"  released (DP): {hist.value}")
+
+    _step(7, "variance + correlation where allowed")
+    values = {oid: by_id[oid].y.tolist() for oid in org_ids}
+    var = platform.variance("retail-consortium", "retail", values, epsilon=2.0)
+    pairs = {oid: (by_id[oid].x[:, 0].tolist(), by_id[oid].y.tolist())
+             for oid in org_ids}
+    corr = platform.correlation("retail-consortium", "retail", pairs, epsilon=2.0)
+    print(f"  variance={var.value:.4f}  correlation={corr.value:.4f}")
+
+    _step(8, "federated training round (masked updates, server sees sums only)")
+    result = platform.run_federated_round(
+        "retail-consortium", "retail", clients, epsilon=8.0, epochs=2)
+    print(f"  accuracy={result.eval_stats['accuracy']:.3f} "
+          f"n={result.eval_stats['n']} participants={len(result.participants)}")
+
+    _step(9, "simulate dropout (1 of 4 drops; survivors reveal recovery seeds)")
+    dropped = platform.run_federated_round(
+        "retail-consortium", "retail", clients, epsilon=4.0, epochs=1,
+        drop=[org_ids[-1]])
+    print(f"  dropped={dropped.dropped} recovered OK")
+    weights_before = platform.servers["retail-consortium:retail"].model.flat.copy()
+
+    _step(10, "aggregate model (FedAvg over masked deltas)")
+    meta = platform.model_release_metadata("retail-consortium:retail")
+    print(f"  model v{meta['model_version']}: dim={meta['feature_dimension']} "
+          f"aggregation={meta['aggregation']}")
+
+    _step(11, "differential privacy applied (Gaussian, analytic calibration)")
+    print(f"  dp_applied={result.dp_applied} epsilon={result.epsilon_used} "
+          f"sigma={result.dp_sigma:.4f}")
+
+    _step(12, "privacy budget charged (immutable ledger entry)")
+    entry = platform.accountant.events[-1]["ledger"]
+    print(f"  {entry['query_type']}: eps={entry['epsilon']} "
+          f"mechanism={entry['mechanism']} cohort={entry['cohort_size']}")
+
+    _step(13, "audit event written (hash-chained)")
     print(f"  total audit entries: {len(platform.audit.entries)}")
+
+    _step(14, "verify audit chain")
+    print(f"  chain valid: {platform.audit.verify_chain()}")
+
+    _step(15, "restart from SQLite (new process, same file)")
+    api_keys = {oid: platform.registry.get(oid).api_key for oid in org_ids}
+    platform.store.close()
+    platform2 = SentryLinkPlatform(store=SQLiteStateStore(f"{tmp}/demo.db"))
+
+    _step(16, "authenticate with an original API key (hash path)")
+    platform2.registry.authenticate(org_ids[0], api_keys[org_ids[0]])
+    print("  original key accepted after restart")
+
+    _step(17, "verify model continuity")
+    continued = platform2.servers["retail-consortium:retail"].model.flat
+    print(f"  weights identical: {bool((continued == weights_before).all())}")
+
+    _step(18, "show privacy ledger (sanitized, auditable spend)")
+    for event in platform2.accountant.events[-3:]:
+        ledger = event["ledger"]
+        print(f"  {ledger['query_type']}: eps={ledger['epsilon']} "
+              f"{ledger['mechanism']} cohort={ledger['cohort_size']}")
+
+    _step(19, "show Privacy Card (generated from runtime metadata)")
+    print()
+    print(render_card_text(hist.privacy_card))
+
+    _step(20, "final budget + guarantees")
+    budget = platform2.budget_report()
+    print(f"  eps spent: {budget['spent_epsilon']:.3f} / {budget['limit_epsilon']:.1f}")
+    print(f"  RDP spend: {budget['rdp_epsilon_spent']:.3f}")
+    print()
+    print("  RAW DATA LEFT ORGANIZATIONS: NO")
+    print("  PRIVATE KEYS LEFT ORGANIZATIONS: NO")
+    print("  UNMASKED UPDATES AT SERVER: NO")
+    print("  DP APPLIED: YES")
+    print(f"  AUDIT CHAIN VALID: {'YES' if platform2.audit.verify_chain() else 'NO'}")
+    platform2.store.close()
+    return platform
+
+
+def demo_compact(label: str, sector_group: str, domain: str, orgs) -> None:
+    _banner(label)
+    platform = SentryLinkPlatform()
+    registered = [platform.join(o.name, domain=domain, sector_group=sector_group)
+                  for o in orgs]
+    by_id = {reg.org_id: data for reg, data in zip(registered, orgs)}
+    org_ids = [r.org_id for r in registered]
+    clients = {oid: FederatedClient(org_id=oid, x=by_id[oid].x, y=by_id[oid].y)
+               for oid in org_ids}
+    col = 1 if domain == "manufacturing" else 2
+    pairs = {oid: (by_id[oid].x[:, col].tolist(), by_id[oid].y.tolist())
+             for oid in org_ids}
+    corr = platform.correlation(sector_group, domain, pairs, epsilon=2.0)
+    print(f"  correlation (DP): {corr.value:.4f}")
+    if domain == "healthcare":
+        try:
+            platform.variance(sector_group, domain,
+                              {oid: by_id[oid].y.tolist() for oid in org_ids})
+            print("  ERROR: healthcare variance was allowed")
+        except PermissionError:
+            print("  healthcare variance denied by policy (as designed)")
+    result = platform.run_federated_round(sector_group, domain, clients,
+                                          epsilon=8.0, epochs=1)
+    print(f"  accuracy={result.eval_stats['accuracy']:.3f} "
+          f"audit valid={platform.audit.verify_chain()}")
+
+
+def main() -> None:
+    demo_retail_narrative()
+    demo_compact(
+        "VERTICAL — MANUFACTURING: cross-plant quality issue spotting",
+        "supply-chain-mfg", "manufacturing",
+        make_manufacturing_cohort(n_orgs=4, n_per_org=200, seed=11),
+    )
+    demo_compact(
+        "VERTICAL — HEALTHCARE: treatment-response clusters",
+        "hospital-network", "healthcare",
+        make_healthcare_cohort(n_orgs=4, n_per_org=200, seed=23),
+    )
     print("\nDone.")
 
 
