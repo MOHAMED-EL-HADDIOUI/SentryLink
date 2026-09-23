@@ -220,7 +220,9 @@ class PolicyEngine:
         norm = float(np.linalg.norm(v))
         if norm > r and norm > 0:
             v = v * (r / norm)
-        return [int(x) for x in np.rint(v)]
+        # Truncate toward zero (never round up): the projected norm is
+        # guaranteed <= radius, which the DP sensitivity bound requires.
+        return [int(x) for x in np.fix(v)]
 
 
 def default_policy_for(org: Organization) -> ConsentPolicy:
