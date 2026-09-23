@@ -12,6 +12,7 @@
 - `sentrylink/platform.py::SentryLinkPlatform` is the single orchestration entry — policy + MPC + DP + audit. `sentrylink/api/app.py` is a thin wrapper over it; add new queries there by delegating to a `platform.py` method.
 - `sentrylink/config.py` holds coupled crypto/DP constants — `FIELD_P = 2**127-1`, `QUANT_SCALE = 1e6`, `MASK_BOUND = 2**40` (int64-safe), `UPDATE_CLIP = 1.0`, `MAX_ORG_CONTRIB = 100.0`. Changing any one breaks masking/DP sensitivity assumptions elsewhere.
 - Privacy split: **Laplace (pure ε-DP)** for `histogram`/`variance`/`correlation` (accountant charged with `delta=0`); **Gaussian ((ε,δ)-DP)** only for federated rounds. Keep this split when adding releases.
+- Accounting is RDP moments-based: every `accountant.charge` site must pass an `rdp=` cost (`laplace_rdp_cost` / `gaussian_rdp_cost`), or enforcement silently falls back to basic composition from the first cost-less event on (`rdp_complete=False`). FL rounds read the applied noise from `RoundResult.dp_sigma` — keep that field truthful.
 - MPC is 2 non-colluding nodes (`NODE_IDS` in `platform.py`); collusion is explicitly out of scope. Beaver triples come from a preprocessing dealer (demo-only, not malicious-secure).
 - `api/app.py::PLATFORM` is a module-level in-memory singleton — no DB. State (registry, servers, audit, accountant) resets on process restart; `GET /federated/model` 404s until a round has run for that `sector_group:domain` key.
 

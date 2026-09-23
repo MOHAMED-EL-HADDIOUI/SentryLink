@@ -11,11 +11,13 @@ from dataclasses import dataclass, field, replace
 
 import numpy as np
 
-from .config import DEFAULT_DELTA, MAX_ORG_CONTRIB
+from .config import DEFAULT_DELTA, MAX_ORG_CONTRIB, UPDATE_CLIP
 from .crypto.differential_privacy import (
     PrivacyAccountant,
     PrivacyBudget,
+    gaussian_rdp_cost,
     laplace_noise,
+    laplace_rdp_cost,
 )
 from .federated.client import FederatedClient
 from .federated.server import FederatedServer, RoundResult
@@ -116,9 +118,17 @@ class SentryLinkPlatform:
             self.servers[key] = FederatedServer(dim=roster_clients[0].dim)
         server = self.servers[key]
 
-        self.accountant.charge(req.budget, purpose=purpose, subject=key)
         result = server.run_round(
             roster_clients, drop=drop, epochs=epochs, apply_dp=True, epsilon=epsilon, delta=delta
+        )
+        # Charge after a successful round (failed rounds consume no budget).
+        # The released mean has replace-one sensitivity 2C/k (see server).
+        sens = 2.0 * UPDATE_CLIP / len(result.participants)
+        self.accountant.charge(
+            req.budget,
+            purpose=purpose,
+            subject=key,
+            rdp=gaussian_rdp_cost(sens, result.dp_sigma) if result.dp_applied else None,
         )
         self.last_round[key] = result
         self.audit.record(
@@ -170,7 +180,10 @@ class SentryLinkPlatform:
         sens = float(MAX_ORG_CONTRIB)
         # Pure ε-DP (Laplace): charge epsilon only, delta stays 0.
         self.accountant.charge(
-            PrivacyBudget(req.epsilon, 0.0), purpose=purpose, subject=f"hist:{sector_group}"
+            PrivacyBudget(req.epsilon, 0.0),
+            purpose=purpose,
+            subject=f"hist:{sector_group}",
+            rdp=laplace_rdp_cost(req.epsilon),
         )
         noise = laplace_noise(len(raw), sens, epsilon)
         noisy = [int(v) for v in np.rint(np.asarray(raw, dtype=np.float64) + noise)]
@@ -232,7 +245,10 @@ class SentryLinkPlatform:
         # variance is released with unit-scale sensitivity after bounded
         # org contributions; production would use smooth sensitivity here.
         self.accountant.charge(
-            PrivacyBudget(req.epsilon, 0.0), purpose=purpose, subject=f"var:{sector_group}"
+            PrivacyBudget(req.epsilon, 0.0),
+            purpose=purpose,
+            subject=f"var:{sector_group}",
+            rdp=laplace_rdp_cost(req.epsilon),
         )
         noise = laplace_noise((), 1.0, epsilon)
         noisy = max(0.0, float(raw) + float(noise))
@@ -285,7 +301,10 @@ class SentryLinkPlatform:
         # r ∈ [-1, 1]: add/remove sensitivity ≤ 2; Laplace keeps the release
         # informative at practical epsilon values.
         self.accountant.charge(
-            PrivacyBudget(req.epsilon, 0.0), purpose=purpose, subject=f"corr:{sector_group}"
+            PrivacyBudget(req.epsilon, 0.0),
+            purpose=purpose,
+            subject=f"corr:{sector_group}",
+            rdp=laplace_rdp_cost(req.epsilon),
         )
         noise = laplace_noise((), 2.0, epsilon)
         noisy = float(np.clip(raw + float(noise), -1.0, 1.0))
@@ -319,4 +338,6 @@ class SentryLinkPlatform:
             "remaining_epsilon": self.accountant.remaining.epsilon,
             "remaining_delta": self.accountant.remaining.delta,
             "events": len(self.accountant.events),
+            "rdp_epsilon_spent": self.accountant.rdp_epsilon(),
+            "rdp_complete": self.accountant.rdp_complete,
         }

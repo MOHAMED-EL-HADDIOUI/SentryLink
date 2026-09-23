@@ -1,4 +1,13 @@
-"""Gaussian differential privacy: noise calibration, budgets, accountant."""
+"""Differential privacy: noise calibration, RDP moments accounting, budgets.
+
+Two composition regimes are supported:
+  - Basic composition (sums of epsilon/delta) — always tracked, and used to
+    enforce limits whenever an event arrives without an RDP cost.
+  - RDP moments accounting (Abadi et al.; Mironov) — per-event Renyi costs are
+    summed per alpha order and converted to (epsilon, delta) on demand. When
+    every event so far carries an RDP cost, limits are enforced on the tighter
+    RDP-converted epsilon instead of the basic sum.
+"""
 
 from __future__ import annotations
 
@@ -46,6 +55,54 @@ def gaussian_noise(
     return rng.normal(0.0, sigma, size=shape)
 
 
+# Standard RDP order set (alpha > 1). Conversion optimizes over these.
+RDP_ALPHAS: tuple[float, ...] = (
+    1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 16.0, 32.0, 64.0,
+)
+
+
+def gaussian_rdp_cost(
+    sensitivity: float, sigma: float, alphas=RDP_ALPHAS
+) -> dict[float, float]:
+    """RDP cost of one Gaussian release: RDP(alpha) = alpha * sens^2 / (2 sigma^2)."""
+    if sensitivity <= 0:
+        raise ValueError("sensitivity must be positive")
+    if sigma <= 0:
+        raise ValueError("sigma must be positive")
+    rho = (sensitivity / sigma) ** 2 / 2.0
+    return {float(a): float(a) * rho for a in alphas}
+
+
+def laplace_rdp_cost(epsilon: float, alphas=RDP_ALPHAS) -> dict[float, float]:
+    """RDP cost of one Laplace release at pure-DP epsilon (Mironov 2017).
+
+    Closed form, evaluated in a factored way so large alpha * epsilon never
+    overflows: rdp = eps + log(w1 + w2 * exp(-(2a-1) * eps)) / (a - 1).
+    Pure epsilon-DP implies RDP(alpha) <= epsilon, so clip there as a guard.
+    """
+    if epsilon <= 0:
+        raise ValueError("epsilon must be positive")
+    out: dict[float, float] = {}
+    for a in alphas:
+        a = float(a)
+        if a <= 1.0:
+            raise ValueError("RDP orders must exceed 1")
+        w1 = a / (2.0 * a - 1.0)
+        w2 = (a - 1.0) / (2.0 * a - 1.0)
+        val = epsilon + math.log(w1 + w2 * math.exp(-(2.0 * a - 1.0) * epsilon)) / (a - 1.0)
+        out[a] = min(val, epsilon)
+    return out
+
+
+def rdp_to_epsilon(rdp: dict[float, float], delta: float) -> float:
+    """Convert summed RDP costs to (epsilon, delta)-DP: min over orders."""
+    if not (0 < delta < 1):
+        raise ValueError("delta must be in (0, 1)")
+    if not rdp:
+        raise ValueError("no RDP costs to convert")
+    return min(v + math.log(1.0 / delta) / (a - 1.0) for a, v in rdp.items())
+
+
 @dataclass(frozen=True)
 class PrivacyBudget:
     epsilon: float
@@ -65,26 +122,61 @@ class PrivacyBudget:
 
 @dataclass
 class PrivacyAccountant:
-    """Tracks epsilon/delta spend per purpose (basic composition)."""
+    """Tracks epsilon/delta spend per purpose.
+
+    Basic-composition sums are always tracked. Each charge may also carry an
+    `rdp` cost dict (see gaussian_rdp_cost / laplace_rdp_cost); those are
+    summed per alpha order. While every event so far has an RDP cost
+    (`rdp_complete`), the epsilon limit is enforced on the tighter
+    RDP-converted epsilon at limit.delta. The first event without an RDP cost
+    permanently falls back to basic-composition enforcement (RDP totals are
+    still accumulated for reporting).
+    """
 
     limit: PrivacyBudget
     spent: PrivacyBudget = field(default_factory=lambda: PrivacyBudget(0.0, 0.0))
     events: list[dict] = field(default_factory=list)
+    rdp_totals: dict[float, float] = field(default_factory=dict)
+    rdp_complete: bool = True
 
-    def charge(self, cost: PrivacyBudget, purpose: str, subject: str) -> dict:
+    def charge(
+        self,
+        cost: PrivacyBudget,
+        purpose: str,
+        subject: str,
+        *,
+        rdp: dict[float, float] | None = None,
+    ) -> dict:
         if cost.epsilon < 0 or cost.delta < 0:
             raise ValueError("cost must be non-negative")
         projected = self.spent + cost
-        if projected.epsilon > self.limit.epsilon + 1e-12:
-            raise PermissionError(
-                f"epsilon budget exceeded for {subject}: "
-                f"{projected.epsilon:.4f} > {self.limit.epsilon:.4f}"
-            )
         if projected.delta > self.limit.delta + 1e-12:
             raise PermissionError(
                 f"delta budget exceeded for {subject}: "
                 f"{projected.delta:.6g} > {self.limit.delta:.6g}"
             )
+        if rdp is not None and self.rdp_complete:
+            keys = set(self.rdp_totals) | set(rdp)
+            proj_rdp = {
+                a: self.rdp_totals.get(a, 0.0) + rdp.get(a, 0.0) for a in keys
+            }
+            if rdp_to_epsilon(proj_rdp, self.limit.delta) > self.limit.epsilon + 1e-12:
+                raise PermissionError(
+                    f"epsilon budget exceeded for {subject} "
+                    f"(RDP-converted at delta={self.limit.delta:.6g})"
+                )
+            self.rdp_totals = proj_rdp
+        else:
+            if projected.epsilon > self.limit.epsilon + 1e-12:
+                raise PermissionError(
+                    f"epsilon budget exceeded for {subject}: "
+                    f"{projected.epsilon:.4f} > {self.limit.epsilon:.4f}"
+                )
+            if rdp is not None:
+                for a, v in rdp.items():
+                    self.rdp_totals[a] = self.rdp_totals.get(a, 0.0) + v
+            else:
+                self.rdp_complete = False
         self.spent = projected
         record = {
             "id": secrets.token_hex(8),
@@ -95,9 +187,18 @@ class PrivacyAccountant:
             "delta_cost": cost.delta,
             "spent_epsilon": self.spent.epsilon,
             "spent_delta": self.spent.delta,
+            "rdp_tracked": rdp is not None,
         }
         self.events.append(record)
         return record
+
+    def rdp_epsilon(self, delta: float | None = None) -> float:
+        """RDP-converted epsilon spent so far (0.0 when nothing RDP-tracked)."""
+        if not self.rdp_totals:
+            return 0.0
+        return rdp_to_epsilon(
+            self.rdp_totals, self.limit.delta if delta is None else delta
+        )
 
     @property
     def remaining(self) -> PrivacyBudget:

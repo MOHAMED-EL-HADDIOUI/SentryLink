@@ -23,6 +23,7 @@ class RoundResult:
     eval_stats: dict
     dp_applied: bool
     epsilon_used: float
+    dp_sigma: float = 0.0  # Gaussian noise scale actually applied (0 when no DP)
 
 
 @dataclass
@@ -82,6 +83,7 @@ class FederatedServer:
 
         dp_applied = False
         eps_used = 0.0
+        dp_sigma = 0.0
         if apply_dp:
             # Central Gaussian DP on the released mean update. Each client's
             # update is L2-clipped to UPDATE_CLIP; replace-one adjacency on
@@ -92,6 +94,7 @@ class FederatedServer:
             aggregate = aggregate + rng.normal(0.0, sigma, size=aggregate.shape)
             dp_applied = True
             eps_used = epsilon
+            dp_sigma = sigma
 
         self.model = LogisticModel.from_flat(self.dim, self.model.flat + aggregate)
 
@@ -105,6 +108,7 @@ class FederatedServer:
             eval_stats=eval_stats,
             dp_applied=dp_applied,
             epsilon_used=eps_used,
+            dp_sigma=dp_sigma,
         )
         self.history.append(result)
         return result

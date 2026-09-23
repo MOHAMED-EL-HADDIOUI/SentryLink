@@ -170,7 +170,9 @@ tests/                    # unit + integration + API tests
 - Malicious-secure triple generation (IKNP OT) or threshold Paillier/CKKS
   instead of the demo dealer
 - Third compute node / robust secret sharing
-- Advanced composition (moments accountant) instead of basic composition
+- Advanced composition via RDP moments accountant — implemented
+  (`crypto/differential_privacy.py`); limits enforce the tighter RDP bound
+  whenever all events carry RDP costs, basic composition otherwise
 - Model-poisoning defenses (Krum / trimmed mean) alongside clipping
 - Persistent storage + horizontal API scale-out
 
