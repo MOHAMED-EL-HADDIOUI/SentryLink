@@ -174,7 +174,8 @@ class SecAggServer:
     def add_recovery_seed(self, survivor: str, dropped: str, seed: bytes) -> None:
         if survivor not in self.roster or dropped not in self.roster:
             raise ValueError("survivor/dropped must be roster members")
-        self._revealed_seeds[tuple(sorted((survivor, dropped)))] = bytes(seed)
+        first, second = sorted((survivor, dropped))
+        self._revealed_seeds[(first, second)] = bytes(seed)
 
     def finalize(self) -> np.ndarray:
         """Return the summed (dequantized) aggregate from received contributions."""
@@ -186,7 +187,8 @@ class SecAggServer:
         residual = np.zeros(self.dim, dtype=np.int64)
         for survivor in received:
             for drop in dropped:
-                key = tuple(sorted((survivor, drop)))
+                first, second = sorted((survivor, drop))
+                key = (first, second)
                 seed = self._revealed_seeds.get(key)
                 if seed is None:
                     raise RuntimeError(

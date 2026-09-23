@@ -102,6 +102,23 @@ def test_accountant_enforces_rdp_when_fully_tracked():
     assert acc.rdp_complete is True
 
 
+def test_accountant_allows_when_basic_fits_but_rdp_does_not():
+    # RDP conversion overhead dominates for a few Laplace releases: basic
+    # (2.0, 0.0) fits the limit even though RDP-converted (~2.2) exceeds it.
+    acc = PrivacyAccountant(limit=PrivacyBudget(2.0, 1e-3))
+    for i in range(2):
+        acc.charge(
+            PrivacyBudget(1.0, 0.0), purpose=f"q{i}", subject="s",
+            rdp=laplace_rdp_cost(1.0),
+        )
+    assert acc.spent.epsilon == pytest.approx(2.0)
+    with pytest.raises(PermissionError):  # third fits neither regime
+        acc.charge(
+            PrivacyBudget(1.0, 0.0), purpose="q2", subject="s",
+            rdp=laplace_rdp_cost(1.0),
+        )
+
+
 def test_accountant_falls_back_to_basic_without_rdp():
     acc = PrivacyAccountant(limit=PrivacyBudget(1.0, 1e-5))
     acc.charge(PrivacyBudget(0.9, 1e-6), purpose="q", subject="s")

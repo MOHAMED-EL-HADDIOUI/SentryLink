@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
 from .. import __version__
 from ..federated.client import FederatedClient
 from ..platform import SentryLinkPlatform
+from ..storage import SQLiteStateStore
 from .schemas import (
     ConsentRequest,
     CorrelationQuery,
@@ -27,11 +31,28 @@ app = FastAPI(
     version=__version__,
 )
 
-PLATFORM = SentryLinkPlatform()
+def build_platform() -> SentryLinkPlatform:
+    """Startup factory: SQLite backend when SENTRYLINK_DB is set, else memory.
+
+    The SQLite store runs schema migrations at construction, so by the time
+    the app serves traffic the database is initialized and migrated.
+    """
+    db = os.environ.get("SENTRYLINK_DB")
+    if db:
+        return SentryLinkPlatform(store=SQLiteStateStore(db))
+    return SentryLinkPlatform()
+
+
+PLATFORM = build_platform()
 
 
 def get_platform() -> SentryLinkPlatform:
     return PLATFORM
+
+
+@app.exception_handler(RuntimeError)
+def _storage_failure(_request, exc: RuntimeError):
+    return JSONResponse(status_code=500, content={"detail": f"storage failure: {exc}"})
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -42,6 +63,25 @@ def health() -> HealthResponse:
         version=__version__,
         orgs=len(p.registry.list()),
         audit_verified=p.audit.verify_chain(),
+        storage=p.store.backend_name,
+    )
+
+
+@app.get("/ready")
+def readiness():
+    """Readiness probe: store reachable AND audit chain intact."""
+    p = get_platform()
+    store_ok = p.store.ping()
+    chain_ok = p.audit.verify_chain()
+    ready = bool(store_ok and chain_ok)
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={
+            "ready": ready,
+            "storage": p.store.backend_name,
+            "store_reachable": store_ok,
+            "audit_verified": chain_ok,
+        },
     )
 
 

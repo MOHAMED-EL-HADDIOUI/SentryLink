@@ -116,7 +116,40 @@ uvicorn sentrylink.api.app:app --reload
 | `POST` | `/federated/round`     | Secure-aggregated FL round (+DP)          |
 | `GET`  | `/federated/model`     | Global model for a cohort                 |
 | `GET`  | `/audit`               | Verify the hash-chained audit log         |
-| `GET`  | `/budgets`             | ε/δ spent vs. remaining                   |
+| `GET`  | `/budgets`             | ε/δ spent vs. remaining (incl. RDP spend) |
+| `GET`  | `/health`              | Liveness + backend (`memory`/`sqlite`)    |
+| `GET`  | `/ready`               | Readiness: store reachable + chain intact |
+
+### Persistent storage
+
+The platform runs on two backends behind one `StateStore` interface:
+
+- **In-memory** (default) — zero I/O, used by tests.
+- **SQLite** (production-like) — SQLAlchemy 2.0, WAL concurrency, one
+  transaction per mutation, versioned migrations, deterministic recovery.
+
+```bash
+# production-like execution: state survives process restarts
+export SENTRYLINK_DB=/var/lib/sentrylink/state.db   # or sqlite:////path/to.db
+uvicorn sentrylink.api.app:app
+curl localhost:8000/ready   # {"ready": true, "storage": "sqlite", ...}
+```
+
+```python
+from sentrylink.platform import SentryLinkPlatform
+from sentrylink.storage import SQLiteStateStore
+
+p = SentryLinkPlatform(store=SQLiteStateStore("/var/lib/sentrylink/state.db"))
+# joins, consent, queries, FL rounds persist transactionally ...
+p2 = SentryLinkPlatform(store=SQLiteStateStore("/var/lib/sentrylink/state.db"))
+assert p2.audit.verify_chain()  # ... and replay deterministically here
+```
+
+Persisted: org identities, salted API-key hashes (**never** plaintext keys),
+consent allow-lists + caps, privacy budgets (spent, events, RDP totals),
+federated models + round history, audit entries. Never persisted: raw rows,
+features, private keys, unmasked updates. See `sentrylink/storage/` and
+`tests/test_storage.py`, `tests/test_recovery.py`.
 
 ---
 
@@ -166,6 +199,9 @@ tests/                    # unit + integration + API tests
   policy differentiation.
 
 ### Production hardening roadmap
+
+- ✅ Persistent storage + migrations + crash recovery — shipped
+  (`sentrylink/storage/`, SQLite + SQLAlchemy, RLock-serialized mutations)
 
 - TLS + mutual auth for the API; HSM/KMS-backed keys
 - Malicious-secure triple generation (IKNP OT) or threshold Paillier/CKKS

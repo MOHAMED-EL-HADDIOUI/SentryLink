@@ -6,12 +6,15 @@ aggregated intelligence. No raw row ever leaves an organization.
 
 from __future__ import annotations
 
+import functools
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 import numpy as np
 
-from .config import DEFAULT_DELTA, MAX_ORG_CONTRIB, UPDATE_CLIP
+from .config import DEFAULT_DELTA, DEFAULT_EPSILON, MAX_ORG_CONTRIB, UPDATE_CLIP
 from .crypto.differential_privacy import (
     PrivacyAccountant,
     PrivacyBudget,
@@ -25,8 +28,20 @@ from .mpc.stats import run_correlation, run_histogram, run_variance
 from .governance.audit import AuditLog
 from .governance.policy import PolicyEngine, QueryRequest, default_policy_for
 from .governance.registry import Organization, Registry
+from .storage import InMemoryStateStore, StateStore, StoreTx, codec
 
 NODE_IDS = ["node-a", "node-b"]
+
+
+def _locked(method):
+    """Serialize mutating platform calls (in-memory objects + store commit)."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 @dataclass
@@ -54,24 +69,85 @@ class SentryLinkPlatform:
     node_ids: list[str] = field(default_factory=lambda: list(NODE_IDS))
     servers: dict[str, FederatedServer] = field(default_factory=dict)
     last_round: dict[str, RoundResult] = field(default_factory=dict)
+    store: StateStore = field(default_factory=InMemoryStateStore, repr=False, compare=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
     def __post_init__(self):
         if self.policy is None:
             self.policy = PolicyEngine(self.registry)
         if self.accountant is None:
-            from .config import DEFAULT_EPSILON
-
             self.accountant = PrivacyAccountant(
                 limit=PrivacyBudget(DEFAULT_EPSILON * 100, DEFAULT_DELTA * 100)
             )
+        # Deterministic recovery: a non-empty store replaces the live objects.
+        # Explicit constructor args act as seed defaults for an empty store.
+        self._restore()
+
+    # ---- persistence -------------------------------------------------
+    def _restore(self) -> bool:
+        """Rebuild live objects from the store; False when the store is empty."""
+        state = self.store.load()
+        if state is None:
+            return False
+        registry = Registry()
+        for raw_org in state.orgs:
+            registry.add_restored(codec.decode_org(raw_org))
+        policy = PolicyEngine(registry)
+        for org_id, raw_policy in state.policies.items():
+            try:
+                policy.set_policy(org_id, codec.decode_policy(raw_policy))
+            except KeyError:
+                continue  # policy for an unknown org: skip defensively
+        self.registry = registry
+        self.policy = policy
+        if state.budget is not None:
+            self.accountant = codec.decode_budget(state.budget)
+        self.audit = AuditLog()
+        self.audit.restore(state.audit)
+        servers: dict[str, FederatedServer] = {}
+        for key, raw_server in state.servers.items():
+            servers[key] = codec.decode_server(key, raw_server, state.rounds.get(key, []))
+        self.servers = servers
+        self.last_round = {k: s.history[-1] for k, s in servers.items() if s.history}
+        return True
+
+    def _reset_empty(self) -> None:
+        self.registry = Registry()
+        self.policy = PolicyEngine(self.registry)
+        self.accountant = PrivacyAccountant(
+            limit=PrivacyBudget(DEFAULT_EPSILON * 100, DEFAULT_DELTA * 100)
+        )
+        self.audit = AuditLog()
+        self.servers = {}
+        self.last_round = {}
+
+    def _commit(self, persist: Callable[[StoreTx], None]) -> None:
+        """Commit one atomic store bundle; reconverge memory on failure."""
+        try:
+            with self.store.transaction() as tx:
+                persist(tx)
+        except Exception:
+            if not self._restore():
+                self._reset_empty()
+            raise
 
     # ---- onboarding --------------------------------------------------
+    @_locked
     def join(self, name: str, domain: str, sector_group: str) -> Organization:
         org = self.registry.register(name, domain, sector_group)
         self.policy.set_policy(org.org_id, default_policy_for(org))
-        self.audit.record("org.join", org_id=org.org_id, name=name, domain=domain)
+        entry = self.audit.record("org.join", org_id=org.org_id, name=name, domain=domain)
+        policy = self.policy.policies[org.org_id]
+
+        def _persist(tx: StoreTx) -> None:
+            tx.save_org(codec.encode_org(org))
+            tx.save_policy(org.org_id, codec.encode_policy(policy))
+            tx.append_audit(entry)
+
+        self._commit(_persist)
         return org
 
+    @_locked
     def set_consent(self, org_id: str, allowed_metrics: set[str]) -> None:
         # Replace only the allow-list; preserve the org's other policy terms
         # (e.g. healthcare's stricter max_epsilon_per_query).
@@ -80,9 +156,17 @@ class SentryLinkPlatform:
         self.policy.set_policy(
             org_id, replace(base, allowed_metrics=frozenset(allowed_metrics))
         )
-        self.audit.record("consent.update", org_id=org_id, metrics=sorted(allowed_metrics))
+        entry = self.audit.record("consent.update", org_id=org_id, metrics=sorted(allowed_metrics))
+        policy = self.policy.policies[org_id]
+
+        def _persist(tx: StoreTx) -> None:
+            tx.save_policy(org_id, codec.encode_policy(policy))
+            tx.append_audit(entry)
+
+        self._commit(_persist)
 
     # ---- federated intelligence -------------------------------------
+    @_locked
     def run_federated_round(
         self,
         sector_group: str,
@@ -131,7 +215,7 @@ class SentryLinkPlatform:
             rdp=gaussian_rdp_cost(sens, result.dp_sigma) if result.dp_applied else None,
         )
         self.last_round[key] = result
-        self.audit.record(
+        entry = self.audit.record(
             "federated.round",
             round_id=result.round_id,
             participants=result.participants,
@@ -140,9 +224,18 @@ class SentryLinkPlatform:
             delta=delta,
             eval=result.eval_stats,
         )
+
+        def _persist(tx: StoreTx) -> None:
+            tx.save_budget(codec.encode_budget(self.accountant))
+            tx.save_server(codec.encode_server(key, server))
+            tx.append_round(key, codec.encode_round(key, result))
+            tx.append_audit(entry)
+
+        self._commit(_persist)
         return result
 
     # ---- protected aggregate queries --------------------------------
+    @_locked
     def histogram(
         self,
         sector_group: str,
@@ -196,7 +289,7 @@ class SentryLinkPlatform:
             if labels
             else noisy
         )
-        self.audit.record(
+        entry = self.audit.record(
             "query.histogram",
             query_id=decision.query_id,
             participants=decision.participants,
@@ -204,6 +297,12 @@ class SentryLinkPlatform:
             delta=delta,
             buckets=len(noisy),
         )
+
+        def _persist_hist(tx: StoreTx) -> None:
+            tx.save_budget(codec.encode_budget(self.accountant))
+            tx.append_audit(entry)
+
+        self._commit(_persist_hist)
         return QueryResult(
             query_id=decision.query_id,
             metric="histogram",
@@ -217,6 +316,7 @@ class SentryLinkPlatform:
             ts=time.time(),
         )
 
+    @_locked
     def variance(
         self,
         sector_group: str,
@@ -253,13 +353,19 @@ class SentryLinkPlatform:
         noise = laplace_noise((), 1.0, epsilon)
         noisy = max(0.0, float(raw) + float(noise))
 
-        self.audit.record(
+        entry = self.audit.record(
             "query.variance",
             query_id=decision.query_id,
             participants=decision.participants,
             epsilon=epsilon,
             delta=delta,
         )
+
+        def _persist_var(tx: StoreTx) -> None:
+            tx.save_budget(codec.encode_budget(self.accountant))
+            tx.append_audit(entry)
+
+        self._commit(_persist_var)
         return QueryResult(
             query_id=decision.query_id,
             metric="variance",
@@ -273,6 +379,7 @@ class SentryLinkPlatform:
             ts=time.time(),
         )
 
+    @_locked
     def correlation(
         self,
         sector_group: str,
@@ -309,13 +416,19 @@ class SentryLinkPlatform:
         noise = laplace_noise((), 2.0, epsilon)
         noisy = float(np.clip(raw + float(noise), -1.0, 1.0))
 
-        self.audit.record(
+        entry = self.audit.record(
             "query.correlation",
             query_id=decision.query_id,
             participants=decision.participants,
             epsilon=epsilon,
             delta=delta,
         )
+
+        def _persist_corr(tx: StoreTx) -> None:
+            tx.save_budget(codec.encode_budget(self.accountant))
+            tx.append_audit(entry)
+
+        self._commit(_persist_corr)
         return QueryResult(
             query_id=decision.query_id,
             metric="correlation",

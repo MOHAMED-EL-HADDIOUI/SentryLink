@@ -44,3 +44,8 @@ class AuditLog:
 
     def by_action(self, action: str) -> list[dict]:
         return [e for e in self.entries if e["action"] == action]
+
+    def restore(self, entries: list[dict]) -> None:
+        """Rebuild from persisted entries (chain re-verified via verify_chain)."""
+        self.entries = [dict(e) for e in entries]
+        self._prev_hash = entries[-1]["hash"] if entries else "0" * 64

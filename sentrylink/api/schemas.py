@@ -96,3 +96,4 @@ class HealthResponse(BaseModel):
     version: str
     orgs: int
     audit_verified: bool
+    storage: str = "memory"  # "memory" | "sqlite"

@@ -1,3 +1,5 @@
+import sys
+
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
@@ -6,16 +8,22 @@ from sentrylink.api.app import app, get_platform, PLATFORM
 from sentrylink.platform import SentryLinkPlatform
 
 
+def _app_module():
+    # NOTE: `import sentrylink.api.app as x` binds the FastAPI instance, not
+    # the module (the package attribute shadows the submodule); only
+    # sys.modules reaches the PLATFORM global the routes actually read.
+    return sys.modules["sentrylink.api.app"]
+
+
 @pytest.fixture()
 def client():
     # fresh platform per test session to avoid cross-test state
     fresh = SentryLinkPlatform()
-    import sentrylink.api.app as app_mod
-
-    app_mod.PLATFORM = fresh
+    mod = _app_module()
+    mod.PLATFORM = fresh
     with TestClient(app) as c:
         yield c
-    app_mod.PLATFORM = PLATFORM
+    mod.PLATFORM = PLATFORM
 
 
 def _join(client, name, domain, group):

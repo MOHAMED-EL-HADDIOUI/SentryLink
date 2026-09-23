@@ -127,10 +127,14 @@ class PrivacyAccountant:
     Basic-composition sums are always tracked. Each charge may also carry an
     `rdp` cost dict (see gaussian_rdp_cost / laplace_rdp_cost); those are
     summed per alpha order. While every event so far has an RDP cost
-    (`rdp_complete`), the epsilon limit is enforced on the tighter
-    RDP-converted epsilon at limit.delta. The first event without an RDP cost
-    permanently falls back to basic-composition enforcement (RDP totals are
-    still accumulated for reporting).
+    (`rdp_complete`), a charge is allowed when EITHER regime fits the limit:
+    the basic sum, or the RDP-converted epsilon at limit.delta. Each regime
+    is an independently valid upper bound, so fitting either one is sound
+    (this matters both ways: RDP is tighter for many Gaussian compositions,
+    basic is tighter for a few Laplace releases where conversion overhead
+    dominates). The first event without an RDP cost permanently falls back
+    to basic-composition enforcement (RDP totals are still accumulated for
+    reporting).
     """
 
     limit: PrivacyBudget
@@ -160,10 +164,13 @@ class PrivacyAccountant:
             proj_rdp = {
                 a: self.rdp_totals.get(a, 0.0) + rdp.get(a, 0.0) for a in keys
             }
-            if rdp_to_epsilon(proj_rdp, self.limit.delta) > self.limit.epsilon + 1e-12:
+            rdp_eps = rdp_to_epsilon(proj_rdp, self.limit.delta)
+            basic_fits = projected.epsilon <= self.limit.epsilon + 1e-12
+            if rdp_eps > self.limit.epsilon + 1e-12 and not basic_fits:
                 raise PermissionError(
-                    f"epsilon budget exceeded for {subject} "
-                    f"(RDP-converted at delta={self.limit.delta:.6g})"
+                    f"epsilon budget exceeded for {subject}: "
+                    f"basic {projected.epsilon:.4f} and RDP {rdp_eps:.4f} "
+                    f"both exceed {self.limit.epsilon:.4f}"
                 )
             self.rdp_totals = proj_rdp
         else:
