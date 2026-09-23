@@ -213,5 +213,53 @@ def test_audit_and_budget_endpoints(client):
     _join(client, "A", "retail", "g-x")
     audit = client.get("/audit").json()
     assert audit["verified"] is True
+    assert audit["head"] == audit["entries"][-1]["hash"]
     budgets = client.get("/budgets").json()
     assert "spent_epsilon" in budgets
+    assert budgets["ledger"] == []
+
+
+def test_preview_endpoint_spends_nothing(client):
+    orgs = [_join(client, f"P{i}", "retail", "g-prev") for i in range(3)]
+    payload = {
+        "org_id": orgs[0]["org_id"],
+        "api_key": orgs[0]["api_key"],
+        "metric": "histogram",
+        "sector_group": "g-prev",
+        "domain": "retail",
+        "epsilon": 1.0,
+    }
+    before = client.get("/budgets").json()
+    r = client.post("/queries/preview", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["allowed"] is True and body["cohort_size"] == 3
+    after = client.get("/budgets").json()
+    assert after["spent_epsilon"] == before["spent_epsilon"]
+    assert client.get("/audit").json()["count"] == 3  # joins only, no charge
+
+
+def test_preview_endpoint_denied_and_auth(client):
+    _join(client, "Solo", "retail", "g-solo")
+    ghost = {"org_id": "ghost", "api_key": "nope"}
+    base = {"metric": "histogram", "sector_group": "g-solo",
+            "domain": "retail", "epsilon": 1.0}
+    assert client.post("/queries/preview", json={**base, **ghost}).status_code == 401
+    member = _join(client, "Solo2", "retail", "g-solo")
+    r = client.post("/queries/preview", json={
+        **base, "org_id": member["org_id"], "api_key": member["api_key"]})
+    assert r.status_code == 200
+    assert r.json()["allowed"] is False
+    assert r.json()["reason_code"] == "COHORT_TOO_SMALL"
+
+
+def test_transparency_and_timeline(client):
+    _join(client, "A", "retail", "g-t")
+    t = client.get("/transparency").json()
+    assert t["status"] == "ok" and t["orgs"] == 1
+    assert t["audit"]["valid"] is True and "head" in t["audit"]
+    assert t["protocol_version"] == "1" and t["schema_version"] >= 1
+    assert t["models"] == {}
+    tl = client.get("/audit/timeline").json()
+    assert tl["verified"] is True
+    assert any(e["stage"] == "governance" for e in tl["timeline"])

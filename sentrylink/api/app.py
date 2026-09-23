@@ -20,6 +20,7 @@ from .schemas import (
     HistogramQuery,
     JoinRequest,
     JoinResponse,
+    PreviewRequest,
     QueryResultResponse,
     RoundResponse,
     VarianceQuery,
@@ -168,6 +169,7 @@ def query_histogram(req: HistogramQuery) -> QueryResultResponse:
         delta=res.delta,
         noise_sigma=res.noise_sigma,
         purpose=res.purpose,
+        privacy_card=res.privacy_card,
     )
 
 
@@ -197,6 +199,7 @@ def query_variance(req: VarianceQuery) -> QueryResultResponse:
         delta=res.delta,
         noise_sigma=res.noise_sigma,
         purpose=res.purpose,
+        privacy_card=res.privacy_card,
     )
 
 
@@ -227,6 +230,21 @@ def query_correlation(req: CorrelationQuery) -> QueryResultResponse:
         delta=res.delta,
         noise_sigma=res.noise_sigma,
         purpose=res.purpose,
+        privacy_card=res.privacy_card,
+    )
+
+
+@app.post("/queries/preview")
+def preview_query(req: PreviewRequest) -> dict:
+    """Privacy preview: projected cost/admission without spending anything."""
+    p = get_platform()
+    require_cohort_member(p, req.sector_group, req.domain, req.org_id, req.api_key)
+    return p.preview(
+        req.metric,
+        req.sector_group,
+        req.domain,
+        epsilon=req.epsilon,
+        delta=req.delta,
     )
 
 
@@ -253,6 +271,7 @@ def federated_round(req: FederatedRoundRequest) -> RoundResponse:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except (KeyError, ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    key = f"{req.sector_group}:{req.domain}"
     return RoundResponse(
         round_id=result.round_id,
         participants=result.participants,
@@ -261,6 +280,8 @@ def federated_round(req: FederatedRoundRequest) -> RoundResponse:
         epsilon_used=result.epsilon_used,
         eval_stats=result.eval_stats,
         weights=result.model.flat.tolist(),
+        metadata=p.model_release_metadata(key),
+        privacy_card=p.federated_release_card(key, req.domain),
     )
 
 
@@ -283,19 +304,64 @@ def get_model(
         "dim": server.dim,
         "weights": server.model.flat.tolist(),
         "rounds": len(server.history),
+        "metadata": p.model_release_metadata(key),
+        "privacy_card": p.federated_release_card(key, domain),
     }
 
 
 @app.get("/audit")
 def audit_log(limit: int = 50) -> dict:
     p = get_platform()
+    entries = p.audit.entries
+    return {
+        "verified": p.audit.verify_chain(),
+        "count": len(entries),
+        "head": entries[-1]["hash"] if entries else "0" * 64,
+        "entries": entries[-limit:],
+    }
+
+
+@app.get("/audit/timeline")
+def audit_timeline(limit: int = 50) -> dict:
+    p = get_platform()
     return {
         "verified": p.audit.verify_chain(),
         "count": len(p.audit.entries),
-        "entries": p.audit.entries[-limit:],
+        "timeline": p.audit.timeline(limit),
     }
 
 
 @app.get("/budgets")
 def budgets() -> dict:
     return get_platform().budget_report()
+
+
+@app.get("/transparency")
+def transparency() -> dict:
+    """Sanitized observatory view: health, budgets, audit, model releases."""
+    from ..config import PROTOCOL_VERSION
+    from ..storage import CURRENT_SCHEMA_VERSION
+
+    p = get_platform()
+    entries = p.audit.entries
+    return {
+        "status": "ok",
+        "protocol_version": PROTOCOL_VERSION,
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "storage": p.store.backend_name,
+        "orgs": len(p.registry.list()),
+        "budget": {
+            "spent_epsilon": p.accountant.spent.epsilon,
+            "remaining_epsilon": p.accountant.remaining.epsilon,
+            "rdp_epsilon_spent": p.accountant.rdp_epsilon(),
+            "events": len(p.accountant.events),
+        },
+        "audit": {
+            "valid": p.audit.verify_chain(),
+            "entries": len(entries),
+            "head": entries[-1]["hash"] if entries else "0" * 64,
+        },
+        "models": {
+            key: p.model_release_metadata(key) for key in sorted(p.servers)
+        },
+    }

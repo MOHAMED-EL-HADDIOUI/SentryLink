@@ -22,6 +22,11 @@ DEFAULT_DELTA = 1e-5
 # organizations contributed (k-anonymity style cohort floor).
 MIN_PARTICIPANTS = 3
 
+# Version of the aggregation/release protocol spoken by this codebase.
+# Bumped only on wire-incompatible protocol changes; surfaced in model
+# release metadata and transparency reports for traceability.
+PROTOCOL_VERSION = "1"
+
 # Per-organization L2 contribution radius for released aggregate vectors
 # (histogram buckets, etc.). One org's vector is projected onto this ball
 # before sharing, so add/remove sensitivity of the joint release = radius.

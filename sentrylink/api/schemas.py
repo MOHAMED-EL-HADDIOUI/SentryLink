@@ -86,6 +86,7 @@ class QueryResultResponse(BaseModel):
     delta: float
     noise_sigma: float
     purpose: str
+    privacy_card: dict | None = None
 
 
 class RoundResponse(BaseModel):
@@ -96,6 +97,16 @@ class RoundResponse(BaseModel):
     epsilon_used: float
     eval_stats: dict
     weights: list[float]
+    metadata: dict = Field(default_factory=dict)
+    privacy_card: dict | None = None
+
+
+class PreviewRequest(MemberAuth):
+    metric: str
+    sector_group: str
+    domain: str
+    epsilon: float = 1.0
+    delta: float = 1e-5
 
 
 class HealthResponse(BaseModel):
