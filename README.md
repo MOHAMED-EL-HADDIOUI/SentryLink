@@ -288,6 +288,10 @@ commit failure, deterministic restart replay (orgs, budgets, models, history,
 credentials). Persisted: identities, key hashes, policies, budgets, models,
 audit. Never persisted: raw rows, features, private keys, unmasked updates,
 plaintext API keys (column-whitelisted + byte-scanned in tests).
+Concurrent writers are guarded by freshness proofs (expected budget spend,
+model rounds, audit tip): stale bundles fail loudly as `409 CONCURRENT_WRITE`
+instead of double-spending — proven by a multiprocess test with real OS
+processes fighting over one SQLite file.
 
 ## Demo
 
@@ -331,13 +335,15 @@ report (tests, security, privacy, persistence, demo).
 
 ## Testing
 
-149 tests, ~1 min, no external services: API + auth matrix, storage,
-recovery, DP/RDP, federated, governance + decision codes, MPC, secret
-sharing, secure aggregation + isolation, concurrency (registrations, charges,
-rounds, exhaustion without double-spend, mixed read/write), verticals,
-privacy artifacts, red team, simulate/bench/report smoke, property and
-boundary tests. CI (3.11/3.12) runs pytest, demo, redteam, all simulates,
-bench, report, privacy review, examples, and repo-wide mypy.
+149 tests, ~1 min, no external services: API + auth matrix (incl. 409),
+storage (incl. stale-commit rejection + event merging), recovery, DP/RDP,
+federated, governance + decision codes, MPC, secret sharing, secure
+aggregation + isolation, thread concurrency (registrations, charges, rounds,
+exhaustion without double-spend, mixed read/write), a multiprocess
+no-double-spend proof over one SQLite file, verticals, privacy artifacts,
+red team (17), simulate/bench/report smoke, property and boundary tests.
+CI (3.11/3.12) runs pytest, demo, redteam, all simulates, bench, report,
+privacy review, examples, and repo-wide mypy.
 
 ## Limitations
 
@@ -364,9 +370,11 @@ formal protocol verification.
 
 Done: RDP accountant · SQLite persistence + recovery · endpoint auth ·
 privacy ledger/preview/cards · red team · simulator · benchmarks · release
-report · vertical policies · request IDs + rate limiting + structured errors.
-Next: per-org rate-limit tuning hooks, richer audit exports, multi-process
-deployment story.
+report · vertical policies · request IDs + rate limiting + structured errors ·
+optimistic-concurrency freshness proofs (409 conflicts, multiprocess
+no-double-spend proof).
+Next: per-org rate-limit tuning hooks, richer audit exports, automatic
+client retry with backoff around 409, multi-reader deployment guidance.
 
 ## Contributing
 
