@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 from ..config import MAX_ORG_CONTRIB, MIN_PARTICIPANTS
 from ..crypto.differential_privacy import PrivacyBudget
+from ..verticals import policy_for_domain
 from ..errors import (
     ConsentDeniedError,
     DomainMismatchError,
@@ -223,11 +224,11 @@ class PolicyEngine:
 
 
 def default_policy_for(org: Organization) -> ConsentPolicy:
-    if org.domain == "healthcare":
-        return ConsentPolicy(
-            allowed_metrics=frozenset({"histogram", "correlation", "federated_model_round"}),
-            min_participants=max(MIN_PARTICIPANTS, 4),
-            max_epsilon_per_query=10.0,
-            purpose="treatment-response research",
-        )
-    return ConsentPolicy.default()
+    """Build the default consent policy from the domain's vertical policy."""
+    vp = policy_for_domain(org.domain)
+    return ConsentPolicy(
+        allowed_metrics=frozenset(vp.allowed_metrics),
+        min_participants=max(MIN_PARTICIPANTS, vp.min_participants),
+        max_epsilon_per_query=vp.max_epsilon_per_query,
+        purpose=vp.purpose,
+    )
