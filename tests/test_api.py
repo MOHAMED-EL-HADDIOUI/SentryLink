@@ -209,6 +209,42 @@ def test_federated_round_api(client):
     assert body["eval_stats"]["n"] == 320
 
 
+def test_conflicting_commit_surfaces_409():
+    import sys
+
+    from sentrylink.errors import ConcurrentWriteError
+    from sentrylink.platform import SentryLinkPlatform
+    from sentrylink.storage import InMemoryStateStore
+
+    class _FlakyStore(InMemoryStateStore):
+        fail = False
+
+        def transaction(self):
+            if self.fail:
+                raise ConcurrentWriteError("stale")
+            return super().transaction()
+
+    mod = sys.modules["sentrylink.api.app"]
+    prev = mod.PLATFORM
+    platform = SentryLinkPlatform(store=_FlakyStore())
+    mod.PLATFORM = platform
+    try:
+        with TestClient(app) as c:
+            orgs = [_join(c, f"C{i}", "retail", "g-cf") for i in range(3)]
+            platform.store.fail = True
+            r = c.post(
+                "/queries/histogram",
+                json={"org_id": orgs[0]["org_id"], "api_key": orgs[0]["api_key"],
+                      "sector_group": "g-cf", "domain": "retail",
+                      "org_buckets": {o["org_id"]: [1, 1] for o in orgs},
+                      "epsilon": 1.0},
+            )
+            assert r.status_code == 409
+            assert r.json()["error"]["code"] == "CONCURRENT_WRITE"
+    finally:
+        mod.PLATFORM = prev
+
+
 def test_audit_and_budget_endpoints(client):
     _join(client, "A", "retail", "g-x")
     audit = client.get("/audit").json()

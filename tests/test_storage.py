@@ -12,6 +12,7 @@ from sentrylink.crypto.differential_privacy import (
     gaussian_rdp_cost,
     laplace_rdp_cost,
 )
+from sentrylink.errors import ConcurrentWriteError
 from sentrylink.federated.model import LogisticModel
 from sentrylink.federated.server import RoundResult
 from sentrylink.governance.audit import AuditLog
@@ -181,7 +182,8 @@ def test_audit_append_order_and_chain(tmp_path):
         log = AuditLog()
         with store.transaction() as tx:
             for i in range(3):
-                tx.append_audit(log.record("op", i=i))
+                entry = log.record("op", i=i)
+                tx.append_audit(entry, expect_prev=entry["prev_hash"])
         state = store.load()
         assert [e["details"]["i"] for e in state.audit] == [0, 1, 2]
         restored = AuditLog()
@@ -201,7 +203,8 @@ def test_transaction_atomicity_on_failure(tmp_path, backend):
                              "sector_group": "g", "api_key_hash": "h", "key_algo": "a",
                              "active": True})
                 tx.append_audit({"id": "1", "ts": 0.0, "action": "a", "details": {},
-                                 "prev_hash": "p", "hash": "h"})
+                                 "prev_hash": "0" * 64, "hash": "h"},
+                                expect_prev="0" * 64)
                 raise RuntimeError("boom mid-bundle")
         assert store.load() is None  # no partial rows survived
     finally:
@@ -209,15 +212,35 @@ def test_transaction_atomicity_on_failure(tmp_path, backend):
 
 
 def test_concurrent_store_writes_serialized(tmp_path):
+    from sentrylink.errors import ConcurrentWriteError
+
     store = _sqlite(tmp_path)
     errors: list[BaseException] = []
     try:
         def worker(tid: int):
             try:
+                log = AuditLog()
                 for i in range(5):
-                    log = AuditLog()
-                    with store.transaction() as tx:
-                        tx.append_audit(log.record("op", tid=tid, i=i))
+                    # CAS-retry loop: a stale tip fails loudly, so rebase the
+                    # thread-local chain onto the winner's tip and retry until
+                    # the append lands exactly once (embedded prev_hash always
+                    # equals the proof, keeping the chain valid).
+                    for _ in range(50):
+                        entry = log.record("op", tid=tid, i=i)
+                        try:
+                            with store.transaction() as tx:
+                                tx.append_audit(entry, expect_prev=entry["prev_hash"])
+                        except ConcurrentWriteError:
+                            log.entries.pop()
+                            fresh = store.load()
+                            log._prev_hash = (
+                                fresh.audit[-1]["hash"]
+                                if fresh and fresh.audit else "0" * 64
+                            )
+                            continue
+                        break
+                    else:
+                        raise RuntimeError("retry budget exhausted")
             except BaseException as exc:  # noqa: BLE001 - collected, asserted below
                 errors.append(exc)
 
@@ -229,6 +252,9 @@ def test_concurrent_store_writes_serialized(tmp_path):
         assert not errors
         state = store.load()
         assert state is not None and len(state.audit) == 40
+        restored = AuditLog()
+        restored.restore(state.audit)
+        assert restored.verify_chain()
     finally:
         store.close()
 
@@ -303,6 +329,67 @@ def test_scanner_detects_planted_sentinel(tmp_path):
     assert len(findings) >= 1
     assert findings[0]["category"] == "secret"
     assert scan_sqlite(db, {"other": [b"absent-value-xyz"]}) == []
+
+
+def _budget_dict(spent_eps, events=()):
+    return {
+        "limit": {"epsilon": 100.0, "delta": 1e-3},
+        "spent": {"epsilon": spent_eps, "delta": 0.0},
+        "events": list(events),
+        "rdp_totals": {},
+        "rdp_complete": True,
+    }
+
+
+def _audit_entry(i, prev):
+    return {"id": f"e{i}", "ts": float(i), "action": "op",
+            "details": {"i": i}, "prev_hash": prev, "hash": f"h{i}"}
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_stale_commits_rejected_and_events_merged(tmp_path, backend):
+    store = InMemoryStateStore() if backend == "memory" else _sqlite(tmp_path)
+    try:
+        with store.transaction() as tx:
+            tx.save_budget(_budget_dict(1.0, [{"id": "A"}]), expect_spent=(0.0, 0.0))
+            tx.append_audit(_audit_entry(0, "0" * 64), expect_prev="0" * 64)
+        # stale expectations fail loudly instead of overwriting
+        with pytest.raises(ConcurrentWriteError):
+            with store.transaction() as tx:
+                tx.save_budget(_budget_dict(2.0, [{"id": "B"}]),
+                               expect_spent=(0.0, 0.0))
+        with pytest.raises(ConcurrentWriteError):
+            with store.transaction() as tx:
+                tx.append_audit(_audit_entry(9, "bogus"), expect_prev="bogus")
+        # fresh proofs succeed; events from both writers survive the merge
+        with store.transaction() as tx:
+            tx.save_budget(_budget_dict(2.0, [{"id": "B"}]),
+                           expect_spent=(1.0, 0.0))
+            tx.append_audit(_audit_entry(1, "h0"), expect_prev="h0")
+        state = store.load()
+        assert state.budget["spent"] == {"epsilon": 2.0, "delta": 0.0}
+        assert {e["id"] for e in state.budget["events"]} == {"A", "B"}
+        assert [e["id"] for e in state.audit] == ["e0", "e1"]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_stale_server_commit_rejected(tmp_path, backend):
+    store = InMemoryStateStore() if backend == "memory" else _sqlite(tmp_path)
+    try:
+        server = {"key": "k", "dim": 4, "bias": 0.0,
+                  "weights": b"\x00" * 40, "rounds": 1}
+        with store.transaction() as tx:
+            tx.save_server(server, expect_rounds=0)
+        with pytest.raises(ConcurrentWriteError):
+            with store.transaction() as tx:
+                tx.save_server({**server, "rounds": 2}, expect_rounds=0)
+        with store.transaction() as tx:
+            tx.save_server({**server, "rounds": 2}, expect_rounds=1)
+        assert store.load().servers["k"]["rounds"] == 2
+    finally:
+        store.close()
 
 
 def test_no_sensitive_data_persisted(tmp_path):

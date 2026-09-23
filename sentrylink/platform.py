@@ -34,7 +34,7 @@ from .crypto.differential_privacy import (
 from .federated.client import FederatedClient
 from .federated.server import FederatedServer, RoundResult
 from .mpc.stats import run_correlation, run_histogram, run_variance
-from .errors import InvalidDataError, StorageError
+from .errors import ConcurrentWriteError, InvalidDataError, StorageError
 from .governance.audit import AuditLog
 from .governance.policy import PolicyEngine, QueryRequest, default_policy_for
 from .governance.registry import Organization, Registry
@@ -134,10 +134,19 @@ class SentryLinkPlatform:
         self.last_round = {}
 
     def _commit(self, persist: Callable[[StoreTx], None]) -> None:
-        """Commit one atomic store bundle; reconverge memory on failure."""
+        """Commit one atomic store bundle; reconverge memory on failure.
+
+        A ConcurrentWriteError means another writer committed first: live
+        objects rebuild from the winner's state and the original conflict
+        propagates (HTTP 409) so the client can retry.
+        """
         try:
             with self.store.transaction() as tx:
                 persist(tx)
+        except ConcurrentWriteError:
+            if not self._restore():
+                self._reset_empty()
+            raise
         except StorageError:
             raise
         except Exception as exc:
@@ -220,7 +229,7 @@ class SentryLinkPlatform:
         def _persist(tx: StoreTx) -> None:
             tx.save_org(codec.encode_org(org))
             tx.save_policy(org.org_id, codec.encode_policy(policy))
-            tx.append_audit(entry)
+            tx.append_audit(entry, expect_prev=entry["prev_hash"])
 
         self._commit(_persist)
         return org
@@ -242,7 +251,7 @@ class SentryLinkPlatform:
 
         def _persist(tx: StoreTx) -> None:
             tx.save_policy(org_id, codec.encode_policy(policy))
-            tx.append_audit(entry)
+            tx.append_audit(entry, expect_prev=entry["prev_hash"])
 
         self._commit(_persist)
 
@@ -283,6 +292,9 @@ class SentryLinkPlatform:
         if key not in self.servers:
             self.servers[key] = FederatedServer(dim=roster_clients[0].dim)
         server = self.servers[key]
+        rounds_before = len(server.history)
+        spent_before = (
+            self._accountant.spent.epsilon, self._accountant.spent.delta)
 
         result = server.run_round(
             roster_clients, drop=drop, epochs=epochs, apply_dp=True, epsilon=epsilon, delta=delta
@@ -321,10 +333,12 @@ class SentryLinkPlatform:
         )
 
         def _persist(tx: StoreTx) -> None:
-            tx.save_budget(codec.encode_budget(self._accountant))
-            tx.save_server(codec.encode_server(key, server))
+            tx.save_budget(codec.encode_budget(self._accountant),
+                           expect_spent=spent_before)
+            tx.save_server(codec.encode_server(key, server),
+                           expect_rounds=rounds_before)
             tx.append_round(key, codec.encode_round(key, result))
-            tx.append_audit(entry)
+            tx.append_audit(entry, expect_prev=entry["prev_hash"])
 
         self._commit(_persist)
         return result
@@ -370,6 +384,8 @@ class SentryLinkPlatform:
         # Add/remove sensitivity of the joint vector: one org's contribution
         # is L2-projected onto the MAX_ORG_CONTRIB ball before sharing.
         sens = float(MAX_ORG_CONTRIB)
+        spent_before = (
+            self._accountant.spent.epsilon, self._accountant.spent.delta)
         # Pure ε-DP (Laplace): charge epsilon only, delta stays 0.
         self._accountant.charge(
             PrivacyBudget(req.epsilon, 0.0),
@@ -411,8 +427,9 @@ class SentryLinkPlatform:
         )
 
         def _persist_hist(tx: StoreTx) -> None:
-            tx.save_budget(codec.encode_budget(self._accountant))
-            tx.append_audit(entry)
+            tx.save_budget(codec.encode_budget(self._accountant),
+                           expect_spent=spent_before)
+            tx.append_audit(entry, expect_prev=entry["prev_hash"])
 
         self._commit(_persist_hist)
         return QueryResult(
@@ -472,6 +489,8 @@ class SentryLinkPlatform:
             raise InvalidDataError(str(exc)) from exc
         # variance is released with unit-scale sensitivity after bounded
         # org contributions; production would use smooth sensitivity here.
+        spent_before = (
+            self._accountant.spent.epsilon, self._accountant.spent.delta)
         self._accountant.charge(
             PrivacyBudget(req.epsilon, 0.0),
             purpose=purpose,
@@ -503,8 +522,9 @@ class SentryLinkPlatform:
         )
 
         def _persist_var(tx: StoreTx) -> None:
-            tx.save_budget(codec.encode_budget(self._accountant))
-            tx.append_audit(entry)
+            tx.save_budget(codec.encode_budget(self._accountant),
+                           expect_spent=spent_before)
+            tx.append_audit(entry, expect_prev=entry["prev_hash"])
 
         self._commit(_persist_var)
         return QueryResult(
@@ -564,6 +584,8 @@ class SentryLinkPlatform:
             raise InvalidDataError(str(exc)) from exc
         # r ∈ [-1, 1]: add/remove sensitivity ≤ 2; Laplace keeps the release
         # informative at practical epsilon values.
+        spent_before = (
+            self._accountant.spent.epsilon, self._accountant.spent.delta)
         self._accountant.charge(
             PrivacyBudget(req.epsilon, 0.0),
             purpose=purpose,
@@ -595,8 +617,9 @@ class SentryLinkPlatform:
         )
 
         def _persist_corr(tx: StoreTx) -> None:
-            tx.save_budget(codec.encode_budget(self._accountant))
-            tx.append_audit(entry)
+            tx.save_budget(codec.encode_budget(self._accountant),
+                           expect_spent=spent_before)
+            tx.append_audit(entry, expect_prev=entry["prev_hash"])
 
         self._commit(_persist_corr)
         return QueryResult(

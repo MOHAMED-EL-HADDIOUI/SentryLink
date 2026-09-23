@@ -1,14 +1,42 @@
 """Concurrency: parallel mutations must not lose updates or corrupt state."""
 
+import multiprocessing as mp
 import threading
 
 import pytest
 
 from sentrylink.crypto.differential_privacy import PrivacyAccountant, PrivacyBudget
+from sentrylink.errors import ConcurrentWriteError
 from sentrylink.federated.client import FederatedClient
 from sentrylink.platform import SentryLinkPlatform
 from sentrylink.storage import SQLiteStateStore
 from sentrylink.usecases import make_retail_cohort
+
+
+def _mp_histogram_worker(db_path, buckets, group, domain, epsilon, attempts, queue):
+    """Separate OS process: charges budget against the shared SQLite file."""
+    from sentrylink.errors import ConcurrentWriteError as _Conflict
+    from sentrylink.platform import SentryLinkPlatform as _Platform
+    from sentrylink.storage import SQLiteStateStore as _Store
+
+    store = _Store(db_path)
+    platform = _Platform(store=store)
+    outcome = {"ok": 0, "denied": 0, "conflicted": 0}
+    try:
+        for _ in range(attempts):
+            try:
+                platform.histogram(group, domain, buckets, epsilon=epsilon)
+                outcome["ok"] += 1
+            except PermissionError:
+                outcome["denied"] += 1
+            except _Conflict:
+                outcome["conflicted"] += 1
+    except BaseException as exc:  # noqa: BLE001 - surfaced to the parent
+        queue.put({"error": repr(exc)})
+    else:
+        queue.put(outcome)
+    finally:
+        store.close()
 
 
 def _platform(path):
@@ -99,6 +127,52 @@ def test_budget_exhaustion_during_concurrency_no_double_spend(tmp_path):
         assert p.budget_report()["spent_epsilon"] == pytest.approx(4.0)
     finally:
         p.store.close()
+
+
+def test_multiprocess_no_double_spend(tmp_path):
+    # Four OS processes fight over the last 3.0 of a 4.0 budget (parent
+    # spent 1.0 first). Any interleaving must yield exactly 3 successes,
+    # spent == limit, and only budget/conflict failures — never lost charges.
+    db = str(tmp_path / "mp.db")
+    parent = SentryLinkPlatform(
+        store=SQLiteStateStore(db),
+        accountant=PrivacyAccountant(limit=PrivacyBudget(4.0, 1e-3)),
+    )
+    try:
+        ids = [parent.join(f"O{i}", "retail", "g-mp").org_id for i in range(3)]
+        buckets = {oid: [4, 2] for oid in ids}
+        parent.histogram("g-mp", "retail", buckets, epsilon=1.0)
+        parent.store.close()
+
+        ctx = mp.get_context("spawn")
+        queue = ctx.Queue()
+        procs = [
+            ctx.Process(target=_mp_histogram_worker,
+                        args=(db, buckets, "g-mp", "retail", 1.0, 3, queue))
+            for _ in range(4)
+        ]
+        for proc in procs:
+            proc.start()
+        for proc in procs:
+            proc.join(timeout=240)
+        assert all(proc.exitcode == 0 for proc in procs)
+        results = [queue.get(timeout=30) for _ in procs]
+        assert not [r for r in results if "error" in r]
+        assert sum(r["ok"] for r in results) == 3
+        assert sum(r["ok"] + r["denied"] + r["conflicted"] for r in results) == 12
+
+        check = SentryLinkPlatform(store=SQLiteStateStore(db))
+        try:
+            assert check.budget_report()["spent_epsilon"] == pytest.approx(4.0)
+            assert len(check.audit.by_action("query.histogram")) == 4
+            assert check.audit.verify_chain()
+        finally:
+            check.store.close()
+    finally:
+        try:
+            parent.store.close()
+        except Exception:  # noqa: BLE001 - already closed above in-flow
+            pass
 
 
 def test_parallel_read_write_activity(tmp_path):

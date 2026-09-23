@@ -20,15 +20,28 @@ state (see SentryLinkPlatform._commit), so in-memory and stored state cannot
 from __future__ import annotations
 
 import copy
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any, Iterator
 
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from ..errors import ConcurrentWriteError
 from . import codec
 from .engine import db_health, init_db
 from .models import AuditRow, BudgetRow, OrgRow, PolicyRow, RoundRow, ServerRow
+
+
+def _merge_events(
+    existing: list, incoming: list
+) -> list:
+    """Union event lists by id: concurrent committers never lose rows."""
+    seen = {e.get("id") for e in existing}
+    return list(existing) + [e for e in incoming if e.get("id") not in seen]
 
 
 @dataclass
@@ -42,11 +55,23 @@ class PersistedState:
 
     @property
     def is_empty(self) -> bool:
-        return not self.orgs and self.budget is None and not self.audit
+        return (
+            not self.orgs
+            and self.budget is None
+            and not self.audit
+            and not self.servers
+            and not self.rounds
+        )
 
 
 class StoreTx(ABC):
-    """One atomic bundle of store writes (commit on clean exit)."""
+    """One atomic bundle of store writes (commit on clean exit).
+
+    Freshness proofs (`expect_*`) implement optimistic concurrency: a bundle
+    computed from stale state fails loudly with ConcurrentWriteError instead
+    of silently overwriting another writer's commit. Single-process callers
+    always present matching proofs, so behavior there is unchanged.
+    """
 
     @abstractmethod
     def save_org(self, org: dict[str, Any]) -> None: ...
@@ -55,16 +80,20 @@ class StoreTx(ABC):
     def save_policy(self, org_id: str, policy: dict[str, Any]) -> None: ...
 
     @abstractmethod
-    def save_budget(self, budget: dict[str, Any]) -> None: ...
+    def save_budget(
+        self, budget: dict[str, Any], *, expect_spent: tuple[float, float]
+    ) -> None: ...
 
     @abstractmethod
-    def save_server(self, server: dict[str, Any]) -> None: ...
+    def save_server(
+        self, server: dict[str, Any], *, expect_rounds: int
+    ) -> None: ...
 
     @abstractmethod
     def append_round(self, server_key: str, round: dict[str, Any]) -> None: ...
 
     @abstractmethod
-    def append_audit(self, entry: dict[str, Any]) -> None: ...
+    def append_audit(self, entry: dict[str, Any], *, expect_prev: str) -> None: ...
 
 
 class StateStore(ABC):
@@ -87,9 +116,10 @@ class StateStore(ABC):
 
 
 class _InMemoryTx(StoreTx):
-    def __init__(self, state: PersistedState):
+    def __init__(self, state: PersistedState, guard: Lock):
         self._ops: list[Any] = []
         self._state = state
+        self._guard = guard
 
     def save_org(self, org: dict[str, Any]) -> None:
         self._ops.append(("org", copy.deepcopy(org)))
@@ -97,17 +127,21 @@ class _InMemoryTx(StoreTx):
     def save_policy(self, org_id: str, policy: dict[str, Any]) -> None:
         self._ops.append(("policy", org_id, copy.deepcopy(policy)))
 
-    def save_budget(self, budget: dict[str, Any]) -> None:
-        self._ops.append(("budget", copy.deepcopy(budget)))
+    def save_budget(
+        self, budget: dict[str, Any], *, expect_spent: tuple[float, float]
+    ) -> None:
+        self._ops.append(("budget", copy.deepcopy(budget), tuple(expect_spent)))
 
-    def save_server(self, server: dict[str, Any]) -> None:
-        self._ops.append(("server", copy.deepcopy(server)))
+    def save_server(
+        self, server: dict[str, Any], *, expect_rounds: int
+    ) -> None:
+        self._ops.append(("server", copy.deepcopy(server), int(expect_rounds)))
 
     def append_round(self, server_key: str, round: dict[str, Any]) -> None:
         self._ops.append(("round", server_key, copy.deepcopy(round)))
 
-    def append_audit(self, entry: dict[str, Any]) -> None:
-        self._ops.append(("audit", codec.normalize_audit_entry(entry)))
+    def append_audit(self, entry: dict[str, Any], *, expect_prev: str) -> None:
+        self._ops.append(("audit", codec.normalize_audit_entry(entry), expect_prev))
 
     def __enter__(self) -> "_InMemoryTx":
         return self
@@ -116,6 +150,12 @@ class _InMemoryTx(StoreTx):
         if exc_type is not None:
             self._ops.clear()  # discard the whole bundle
             return
+        # One guard for check+apply makes concurrent bundles atomic here too.
+        with self._guard:
+            self._apply()
+
+    def _apply(self) -> None:
+        tip = self._state.audit[-1]["hash"] if self._state.audit else "0" * 64
         for op in self._ops:
             kind = op[0]
             if kind == "org":
@@ -123,13 +163,30 @@ class _InMemoryTx(StoreTx):
             elif kind == "policy":
                 self._state.policies[op[1]] = op[2]
             elif kind == "budget":
-                self._state.budget = op[1]
+                _, data, expect = op
+                cur = self._state.budget
+                if cur is not None and (
+                    cur["spent"]["epsilon"], cur["spent"]["delta"]
+                ) != (expect[0], expect[1]):
+                    raise ConcurrentWriteError("budget changed since read")
+                if cur is not None:
+                    data = {**data, "events": _merge_events(
+                        cur.get("events", []), data.get("events", []))}
+                self._state.budget = data
             elif kind == "server":
-                self._state.servers[op[1]["key"]] = op[1]
+                _, data, expect_rounds = op
+                cur = self._state.servers.get(data["key"])
+                if cur is not None and cur["rounds"] != expect_rounds:
+                    raise ConcurrentWriteError("server model changed since read")
+                self._state.servers[data["key"]] = data
             elif kind == "round":
                 self._state.rounds.setdefault(op[1], []).append(op[2])
             elif kind == "audit":
-                self._state.audit.append(op[1])
+                _, data, expect_prev = op
+                if tip != expect_prev:
+                    raise ConcurrentWriteError("audit tip moved since read")
+                self._state.audit.append(data)
+                tip = data["hash"]
         self._ops.clear()
 
 
@@ -138,14 +195,16 @@ class InMemoryStateStore(StateStore):
 
     def __init__(self) -> None:
         self._state = PersistedState()
+        self._guard = Lock()
 
     def load(self) -> PersistedState | None:
-        if self._state.is_empty:
-            return None
-        return copy.deepcopy(self._state)
+        with self._guard:
+            if self._state.is_empty:
+                return None
+            return copy.deepcopy(self._state)
 
     def transaction(self) -> _InMemoryTx:
-        return _InMemoryTx(self._state)
+        return _InMemoryTx(self._state, self._guard)
 
     def ping(self) -> bool:
         return True
@@ -180,30 +239,66 @@ class _SQLiteTx(StoreTx):
             )
         )
 
-    def save_budget(self, budget: dict[str, Any]) -> None:
-        self._s.merge(
-            BudgetRow(
-                id=1,
-                limit_epsilon=float(budget["limit"]["epsilon"]),
-                limit_delta=float(budget["limit"]["delta"]),
-                spent_epsilon=float(budget["spent"]["epsilon"]),
-                spent_delta=float(budget["spent"]["delta"]),
-                rdp_totals={str(k): float(v) for k, v in budget.get("rdp_totals", {}).items()},
-                rdp_complete=bool(budget.get("rdp_complete", True)),
-                events=list(budget.get("events", [])),
-            )
-        )
+    def save_budget(
+        self, budget: dict[str, Any], *, expect_spent: tuple[float, float]
+    ) -> None:
+        row = self._s.get(BudgetRow, 1)
+        if row is None:
+            try:
+                self._s.add(
+                    BudgetRow(
+                        id=1,
+                        limit_epsilon=float(budget["limit"]["epsilon"]),
+                        limit_delta=float(budget["limit"]["delta"]),
+                        spent_epsilon=float(budget["spent"]["epsilon"]),
+                        spent_delta=float(budget["spent"]["delta"]),
+                        rdp_totals={str(k): float(v) for k, v in budget.get("rdp_totals", {}).items()},
+                        rdp_complete=bool(budget.get("rdp_complete", True)),
+                        events=list(budget.get("events", [])),
+                    )
+                )
+                self._s.flush()
+            except IntegrityError as exc:
+                raise ConcurrentWriteError(
+                    "budget row created concurrently") from exc
+            return
+        if (row.spent_epsilon, row.spent_delta) != (
+            float(expect_spent[0]), float(expect_spent[1])):
+            raise ConcurrentWriteError("budget changed since read")
+        row.limit_epsilon = float(budget["limit"]["epsilon"])
+        row.limit_delta = float(budget["limit"]["delta"])
+        row.spent_epsilon = float(budget["spent"]["epsilon"])
+        row.spent_delta = float(budget["spent"]["delta"])
+        row.rdp_totals = {str(k): float(v) for k, v in budget.get("rdp_totals", {}).items()}
+        row.rdp_complete = bool(budget.get("rdp_complete", True))
+        row.events = _merge_events(list(row.events), list(budget.get("events", [])))
 
-    def save_server(self, server: dict[str, Any]) -> None:
-        self._s.merge(
-            ServerRow(
-                key=server["key"],
-                dim=int(server["dim"]),
-                bias=float(server["bias"]),
-                weights=bytes(server["weights"]),
-                rounds=int(server["rounds"]),
-            )
-        )
+    def save_server(
+        self, server: dict[str, Any], *, expect_rounds: int
+    ) -> None:
+        row = self._s.get(ServerRow, server["key"])
+        if row is None:
+            try:
+                self._s.add(
+                    ServerRow(
+                        key=server["key"],
+                        dim=int(server["dim"]),
+                        bias=float(server["bias"]),
+                        weights=bytes(server["weights"]),
+                        rounds=int(server["rounds"]),
+                    )
+                )
+                self._s.flush()
+            except IntegrityError as exc:
+                raise ConcurrentWriteError(
+                    "server row created concurrently") from exc
+            return
+        if row.rounds != int(expect_rounds):
+            raise ConcurrentWriteError("server model changed since read")
+        row.dim = int(server["dim"])
+        row.bias = float(server["bias"])
+        row.weights = bytes(server["weights"])
+        row.rounds = int(server["rounds"])
 
     def append_round(self, server_key: str, round: dict[str, Any]) -> None:
         self._s.add(
@@ -222,8 +317,30 @@ class _SQLiteTx(StoreTx):
             )
         )
 
-    def append_audit(self, entry: dict[str, Any]) -> None:
-        self._s.add(AuditRow(entry=codec.normalize_audit_entry(entry)))
+    def append_audit(self, entry: dict[str, Any], *, expect_prev: str) -> None:
+        data = codec.normalize_audit_entry(entry)
+        # Single-statement conditional INSERT: the tip check and the insert
+        # are atomic, so concurrent bundles serialize here even though the
+        # connection runs DEFERRED. Zero inserted rows = lost the race.
+        # Every platform bundle ends with exactly one audit append, which
+        # makes this gate serialize ALL bundles (rollback undoes the rest).
+        result = self._s.execute(
+            text(
+                "INSERT INTO audit_log (entry) "
+                "SELECT :entry WHERE COALESCE("
+                "  (SELECT json_extract(entry, '$.hash') FROM audit_log "
+                "   ORDER BY seq DESC LIMIT 1), "
+                "  '0000000000000000000000000000000000000000000000000000000000000000'"
+                ") = :expect_prev"
+            ),
+            {"entry": json.dumps(data), "expect_prev": expect_prev},
+        )
+        # NOTE: pysqlite populates rowcount for INSERT...SELECT; the stubs
+        # do not model it, hence the ignore (runtime-proven by the
+        # concurrent CAS-retry test, which only passes if 0-row races
+        # are detected here).
+        if result.rowcount != 1:  # type: ignore[attr-defined]
+            raise ConcurrentWriteError("audit tip moved since read")
 
 
 class _SQLiteTxContext:

@@ -42,6 +42,17 @@ class RateLimitedError(SentryLinkError):
     http_status = 429
 
 
+class ConcurrentWriteError(SentryLinkError):
+    """Optimistic-concurrency conflict: committed state moved under us.
+
+    Never silent: the caller reconverges from the store and the client may
+    retry the (idempotent-cheap) operation. Maps to HTTP 409 Conflict.
+    """
+
+    code = "CONCURRENT_WRITE"
+    http_status = 409
+
+
 # ---- governance (raised from policy evaluation; still PermissionError) ----
 
 class GovernanceError(PermissionError, SentryLinkError):

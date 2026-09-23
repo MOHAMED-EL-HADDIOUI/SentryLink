@@ -110,7 +110,8 @@ def _bench_sqlite():
         store = SQLiteStateStore(f"{tmp}/b.db")
         log = AuditLog()
         with store.transaction() as tx:
-            tx.append_audit(log.record("bench", i=1))
+            entry = log.record("bench", i=1)
+            tx.append_audit(entry, expect_prev=entry["prev_hash"])
         store.close()
 
 

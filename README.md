@@ -12,7 +12,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-%3E%3D3.11-3776AB?style=flat-square&logo=python&logoColor=white" alt="python" />
-  <img src="https://img.shields.io/badge/tests-143_passed-34D399?style=flat-square" alt="tests" />
+  <img src="https://img.shields.io/badge/tests-149_passed-34D399?style=flat-square" alt="tests" />
   <img src="https://img.shields.io/badge/mypy-clean-4F46E5?style=flat-square" alt="mypy" />
   <img src="https://img.shields.io/badge/license-MIT-6D28D9?style=flat-square" alt="license" />
   <img src="https://img.shields.io/badge/storage-sqlite_%2B_memory-06B6D4?style=flat-square" alt="storage" />
@@ -169,7 +169,7 @@ pip install -r requirements.txt
 
 python -m pytest -q            # 143 tests, no external services
 python -m sentrylink.demo      # 20-step narrative across all verticals
-python -m sentrylink.redteam   # 16 adversarial self-checks
+python -m sentrylink.redteam   # 17 adversarial self-checks
 python -m sentrylink.simulate --vertical manufacturing [--json]
 python -m sentrylink.bench [--json]
 python -m sentrylink.report [--json]
@@ -202,9 +202,10 @@ headers for GETs (keys never travel in URLs). Every response carries
 `X-Request-Id` (accepted inbound when well-formed, else generated).
 
 HTTP semantics: `400` invalid data · `401` bad credential · `403` non-member /
-governance / budget · `404` no model yet · `422` malformed body ·
-`429` rate limited (never confused with budget exhaustion) ·
-`500` internal · `503` not ready. Error bodies are structured:
+governance / budget · `404` no model yet · `409` concurrent-write conflict
+(stale writer lost a race; reconverged client-side, safe to retry) ·
+`422` malformed body · `429` rate limited (never confused with budget
+exhaustion) · `500` internal · `503` not ready. Error bodies are structured:
 `{"error": {"code": "BUDGET_EXHAUSTED", "message": "…", "request_id": "…"}}`.
 
 ## Federated Learning
@@ -299,7 +300,7 @@ manufacturing/healthcare passes, ending with a guarantees panel
 
 ## Red-Team Mode
 
-`python -m sentrylink.redteam` — 16 checks (bad credentials, non-members,
+`python -m sentrylink.redteam` — 17 checks (bad credentials, non-members,
 cross-domain, small cohorts, healthcare violations, duplicates, NaN/inf,
 dim mismatch, exhaustion, DB failure, key retention, raw persistence, audit
 tampering, dropout inconsistency, honest-round sanity). Not an offensive
@@ -330,7 +331,7 @@ report (tests, security, privacy, persistence, demo).
 
 ## Testing
 
-143 tests, ~1 min, no external services: API + auth matrix, storage,
+149 tests, ~1 min, no external services: API + auth matrix, storage,
 recovery, DP/RDP, federated, governance + decision codes, MPC, secret
 sharing, secure aggregation + isolation, concurrency (registrations, charges,
 rounds, exhaustion without double-spend, mixed read/write), verticals,
@@ -343,7 +344,11 @@ bench, report, privacy review, examples, and repo-wide mypy.
 Honest boundaries, by design:
 
 ```text
-single-process assumption (threads + SQLite-writer serialized)
+single-process assumption for low-latency paths (threads + SQLite-writer
+serialized); concurrent cross-process writers are safe but conflicting —
+budgets, models and audit tips carry freshness proofs, so races fail loudly
+as 409 CONCURRENT_WRITE instead of double-spending (proven by a
+multiprocess no-double-spend test), at the cost of client retries
 2-node collusion out of scope
 transport TLS is deployment-side
 poisoning defense is limited (clipping + DP noise only)

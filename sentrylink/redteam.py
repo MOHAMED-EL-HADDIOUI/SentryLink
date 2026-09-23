@@ -350,6 +350,47 @@ def check_dropout_consistency():
     return _result("dropout inconsistency detected", True, "missing seeds fail; recovery exact")
 
 
+def check_concurrent_double_spend():
+    import threading
+
+    from sentrylink.crypto.differential_privacy import PrivacyAccountant, PrivacyBudget
+    from sentrylink.errors import ConcurrentWriteError
+    from sentrylink.platform import SentryLinkPlatform
+
+    p = SentryLinkPlatform(
+        accountant=PrivacyAccountant(limit=PrivacyBudget(4.0, 1e-3)))
+    ids = [p.join(f"O{i}", "retail", "g-c").org_id for i in range(3)]
+    buckets = {oid: [4, 2] for oid in ids}
+    outcomes: list[str] = []
+    lock = threading.Lock()
+
+    def _try():
+        try:
+            p.histogram("g-c", "retail", buckets, epsilon=1.0)
+            outcome = "ok"
+        except PermissionError:
+            outcome = "denied"
+        except ConcurrentWriteError:
+            outcome = "conflicted"
+        with lock:
+            outcomes.append(outcome)
+
+    threads = [threading.Thread(target=_try) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    spent = p.budget_report()["spent_epsilon"]
+    if abs(spent - 4.0) > 1e-9:
+        return _result("concurrent double-spend blocked",
+                       False, f"spent={spent}, expected exactly 4.0")
+    if outcomes.count("ok") != 4:
+        return _result("concurrent double-spend blocked",
+                       False, f"ok={outcomes.count('ok')}, expected 4")
+    return _result("concurrent double-spend blocked", True,
+                   "spent exactly 4.0 across 8 racers")
+
+
 def check_honest_round_succeeds():
     from sentrylink.federated.client import FederatedClient
     from sentrylink.platform import SentryLinkPlatform
@@ -381,6 +422,7 @@ CHECKS = [
     check_raw_data_persistence,
     check_audit_tampering,
     check_dropout_consistency,
+    check_concurrent_double_spend,
     check_honest_round_succeeds,
 ]
 
