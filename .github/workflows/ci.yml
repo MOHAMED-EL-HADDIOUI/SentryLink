@@ -16,6 +16,18 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m pytest -q
       - run: python -m sentrylink.demo
+      - run: python -m sentrylink.redteam
+      - run: python -m sentrylink.simulate --vertical retail
+      - run: python -m sentrylink.simulate --vertical manufacturing
+      - run: python -m sentrylink.simulate --vertical healthcare
+      - run: python -m sentrylink.bench
+      - run: python -m sentrylink.report
+      - run: python scripts/privacy_review.py
+      - run: python -m examples.register_org
+      - run: python -m examples.run_histogram
+      - run: python -m examples.run_federated_round
+      - run: python -m examples.restart_sqlite
+      - run: python -m examples.privacy_preview
 
   typecheck:
     runs-on: ubuntu-latest
@@ -25,4 +37,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt mypy==1.19.1
-      - run: python -m mypy sentrylink/storage
+      - run: python -m mypy sentrylink
